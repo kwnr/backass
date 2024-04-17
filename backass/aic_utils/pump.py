@@ -1,15 +1,12 @@
 import serial
 import serial.rs485
 import numpy as np
-import time
-
 
 
 class Pump:
     def __init__(self, pipeset):
         try:
-            self.ser = serial.Serial("/dev/ttyelmo", baudrate=115200, timeout=1)
-            # self.ser.rs485_mode = serial.rs485.RS485Settings(delay_before_rx=2e-3, delay_before_tx=1e-3)
+            self.ser = serial.Serial("/dev/ttyELMO", baudrate=115200, timeout=1)
         except serial.SerialException:
             print("FATAL: Could not open serial")
             raise SystemExit(1)
@@ -33,7 +30,7 @@ class Pump:
         # return
         self.act_rpm = 0
         self.des_rpm = 0
-        self.des_cur = 0.
+        self.des_cur = 0.0
         self.temp = 0
 
         # pump params
@@ -45,7 +42,7 @@ class Pump:
         self.tgt_stop_dec = 2500
         self.has_motor_enabled = False
         self.has_motor_disabled = False
-        
+
     def __del__(self):
         self.ser.close()
         print(f"class {__name__} deleted")
@@ -59,7 +56,9 @@ class Pump:
                 self.tgt_rpm = self.max_rpm
                 # print(f"auto rpm saturated @ {self.tgt_rpm}")
             else:
-                self.tgt_rpm = ((self.max_rpm - self.min_rpm) // self.max_err * self.err_norm) + self.min_rpm
+                self.tgt_rpm = (
+                    (self.max_rpm - self.min_rpm) // self.max_err * self.err_norm
+                ) + self.min_rpm
                 self.tgt_rpm = np.clip(self.tgt_rpm, self.min_rpm, self.max_rpm)
                 # print(f"auto rpm tgts @ {self.tgt_rpm}")
             self.elmo.set_motor_tgt_rpm(self.tgt_rpm)
@@ -73,7 +72,6 @@ class Pump:
         self.err_norm = data["err_norm"]
         self.max_rpm = data["max_rpm"]
         self.min_rpm = data["min_rpm"]
-        
 
     def get_elmo_state(self):
         self.act_rpm = self.elmo.get_elmo_fb_rpm()
@@ -85,15 +83,14 @@ class Pump:
         frame = 0
         try:
             while True:
-                t = time.time_ns
                 if self.conn.poll():
                     self.receiver()
                 self.get_elmo_state()
-                
+
                 if self.power == 1:
                     if not self.has_motor_enabled:
                         print("MOTOR ON")
-                        res = self.elmo.set_motor_on()
+                        self.elmo.set_motor_on()
                         self.elmo.set_motor_max_acc(self.max_acc)
                         self.elmo.set_motor_max_dec(self.max_dec)
                         self.elmo.set_motor_tgt_stop_dec(self.tgt_stop_dec)
@@ -105,32 +102,33 @@ class Pump:
                     # print(f"err norm: {self.err_norm}")
                     self.control()
                     # rate needs to be specified
-                
+
                 else:
                     if not self.has_motor_disabled:
                         print("MOTOR OFF")
                         self.elmo.set_motor_tgt_rpm(0)
                         self.elmo.begin_motion()
-                        res = self.elmo.set_motor_off()
+                        self.elmo.set_motor_off()
                         self.has_motor_enabled = False
                         self.has_motor_disabled = True
-                
-                frame +=1
+
+                frame += 1
                 if not self.conn_opp.poll():
-                    self.conn.send({
-                        "frame": frame,
-                        "act_rpm": self.act_rpm,
-                        "des_rpm": self.des_rpm,
-                        "des_cur": self.des_cur,
-                        "temp": self.temp,
-                    })
-                    
-            res = self.elmo.set_motor_off()
+                    self.conn.send(
+                        {
+                            "frame": frame,
+                            "act_rpm": self.act_rpm,
+                            "des_rpm": self.des_rpm,
+                            "des_cur": self.des_cur,
+                            "temp": self.temp,
+                        }
+                    )
+
+            self.elmo.set_motor_off()
         except KeyboardInterrupt:
             self.elmo.set_motor_off()
             print(f"Inturrupted by user. Process {__name__} closed.")
             return
-            
 
 
 class Elmo:
@@ -143,7 +141,7 @@ class Elmo:
         if len(res) == 3:
             temp = float(res[1])
         else:
-            temp = -1.
+            temp = -1.0
         return temp
 
     def get_elmo_des_rpm(self):
@@ -159,7 +157,7 @@ class Elmo:
         if len(res) == 3:
             rpm = int(int(res[1]) // self.cnt_rpm)
         else:
-            rpm = -1         
+            rpm = -1
         return rpm
 
     def get_elmo_des_cur(self):
@@ -167,15 +165,15 @@ class Elmo:
         if len(res) == 3:
             cur = float(res[1])
         else:
-            cur = -1.
+            cur = -1.0
         return cur
 
     def write(self, command: str):
         self.ser.flush()
         self.ser.write(command.encode("ASCII"))
         fb1 = self.ser.read_until(b";").decode()
-        fb2 = self.ser.read_until(b';').decode()
-        feedback = fb1+fb2
+        fb2 = self.ser.read_until(b";").decode()
+        feedback = fb1 + fb2
         self.ser.flush()
         # print(f"feedback for command {command}: {feedback}")
         if "?" in feedback:
@@ -207,7 +205,7 @@ class Elmo:
         # is SD correct? could be SF
 
     def begin_motion(self):
-        return self.write(f"BG;")
+        return self.write("BG;")
 
     def flush(self):
         self.ser.reset_input_buffer()

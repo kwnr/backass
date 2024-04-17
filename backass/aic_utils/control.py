@@ -25,8 +25,6 @@ class Control:
         self._joint_pos: np.ndarray = np.zeros(16)  # received from state over main
         self._ref_pos: np.ndarray = np.zeros(16)  # received from master over main
 
-        self.joint_power: np.ndarray = np.ones(16)
-
         self.phidget_1002 = [VoltageOutput.VoltageOutput() for i in range(16)]
 
         self.log_size = 64
@@ -43,7 +41,14 @@ class Control:
         self.smooth_factor = np.ones(16)
         self.is_clamp = np.array([False] * 16)
         
+        
+        self.joint_power = np.ones(16)
+        self.joint_pos = np.ones(16)
+        self.ref_pos = np.ones(16)
+        self.smooth_factor = np.ones(16)
         self.cmd_override = np.array([np.nan]*16, dtype=float)
+        self.max_rpm = 0
+        self.des_rpm = 0
 
         self.err_norm = 0.
         
