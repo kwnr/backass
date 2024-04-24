@@ -8,11 +8,20 @@ from Phidget22.Devices import VoltageOutput
 from Phidget22 import ErrorCode
 from Phidget22 import PhidgetException
 
+import copy
+
 import traceback
 import logging
 
+import rclpy
+from rclpy.node import Node
+import rclpy.time
+import rclpy.timer
+
 class Control:
     def __init__(self, pipeset):
+        self.node = Node("ctrl")
+        
         print("Initializing Control Process...")
         self.conn = pipeset[0]
         self.conn_opp = pipeset[1]
@@ -55,9 +64,9 @@ class Control:
         self.phidget_retry_counter = 1
                 
         self.joint_min = np.array([-1000, -1000, -1000, -1000, -1000, -1000, -1000, -1000,
-                                   -1000, -1000, -1000, -1000, -1000, -1000, 34.16, -56])
+                                   -1000, -1000, -1000, -1000, -1000, -1000, -1000, -1000])
         self.joint_max = np.array([1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
-                                   1000, 1000, 1000, 1000, 1000, 1000, 34.7, -46])
+                                   1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000])
         
         # 34.1, -56
         # 34.2, -46
@@ -72,6 +81,12 @@ class Control:
         self.lpm4_flow = np.polynomial.Polynomial([0, 0.86869, 0.16426, -0.01125])
         
         self.k_fd = 0
+
+        self.q1_diff = FiniteDiff()
+        self.q2_diff = FiniteDiff()
+        self.e_diff = FiniteDiff()
+        self.q_ddiff = FiniteDDiff()
+        
 
     def __del__(self):
         self.close_phidget()
@@ -233,11 +248,69 @@ class Control:
             if is_lesser[i] and cmd[i] < 0:
                 cmd[i] = 0
         return cmd
+    
+    @staticmethod
+    def CalDynamics(q1,q2,q1_dot,q2_dot):
+        m1 = 4.039 #kg
+        m2 = 5.804 #kg
+        l1 = 0.45 # m
+        l2 = 0.45 # m
+        g = 9.81
         
+        q2 = np.deg2rad(q2)        
+        
+        M11 = (m1 + m2) * l2**2 + m2 * l2**2 + 2 * m2 * l1 * l2 * np.cos(q2)
+        M12 = m2 * l2**2 + m2 * l1 * l2 * np.cos(q2)
+        M21 = M12
+        M22 = m2 * l2**2
+        M = np.array([[M11, M12],[M21, M22]])
+        C1 = (-m2 * l1 * l2 * np.sin(q2) * q2_dot 
+              - m2 * l1 * l2 * np.sin(q2) * (q1_dot + q2_dot))
+        C2 = m2*l1*l2*np.sin(q2)*q1_dot
+        C = np.array([[C1],[C2]])
+        G1 = (m1+m2)*g*l1*np.cos(q1)+m2*g*l2*np.cos(q1+q2)
+        G2 = m2*g*l2*np.cos(q1+q2)
+        G = np.array([[G1],[G2]])
+        
+        return M, C, G
+    
+    def smc_1_dof(self, t, pos, ref):
+        t = t/1e9
+        q1 = np.deg2rad(-90)
+        q2 = np.deg2rad(-(pos-90))
+        des_q1 = np.deg2rad(-90)
+        des_q2 = np.deg2rad(-(ref-90))
+        e1 = des_q1 - q1
+        e2 = des_q2 - q2
+        
+        q1_dot = self.q1_diff.update(t, q1)
+        q2_dot = self.q2_diff.update(t, q2)
+        
+        M, C, G = self.CalDynamics(q1, q2, q1_dot, q2_dot)
+        
+        g_x = np.linalg.inv(M)
+        f_x = g_x@(-C * np.array([[q1_dot],
+                                  [q2_dot]]) - G)
+        
+        q = np.array([[q1],
+                      [q2]])
+        c = np.array([[5],
+                      [5]])
+        e = np.array([[e1],
+                      [e2]])
+        e_dot = self.e_diff.update(t, e)
+        des_q_ddot = self.q_ddiff.update(t, np.array([[des_q1], 
+                                                      [des_q2]]))
+        
+        D = 0
+        s = c * e - e_dot
+        u = M @ (c * e_dot + des_q_ddot - f_x + D * np.sign(s))
+        # print(f"{c.flatten()} * {e_dot.flatten()} + {des_q_ddot.flatten()} - {f_x.flatten()}")
+        print(u.flatten())
+        return u
+    
     def run(self):
-        # rate = rospy.Rate(1000)
         frame = 0
-        f = open("log_kfd.txt", 'w')
         try:
             self.init_phidget()
             self.set_phidget_enabled(list(range(16)))
@@ -247,6 +320,7 @@ class Control:
                 if self.conn.poll():
                     self.receiver()
                 t = time.monotonic_ns()
+                # u = self.smc_1_dof(t, self.joint_pos[11], self.ref_pos[11])
                 err = self.err_calc()
                 err = err * [1, 1, 1, 1, -1, 1, 1, 1,
                              1, 1, 1, 1, -1, 1, 1, 1,]
@@ -257,8 +331,8 @@ class Control:
                 self.is_clamp = (vd_sat != vd) & (np.sign(vd) == np.sign(err))
                 Q_j_est = self.joint_flow_estimator(vd_sat)
                 Q_p_est = self.mhpu_flow_estimator(self.des_rpm)
-                v_fc = self.flow_distributer(vd_sat, Q_j_est, Q_p_est)
-                v_dc = self.dead_zone_compensate(v_fc, 1.2, 0.01)
+                # v_fc = self.flow_distributer(vd_sat, Q_j_est, Q_p_est*1.2)
+                v_dc = self.dead_zone_compensate(vd_sat, 1.2, 0.01)
                 cmd = v_dc
                 cmd[~np.isnan(self.cmd_override)] = self.cmd_override[~np.isnan(self.cmd_override)]
                 cmd = self.min_max_saturation(cmd)
@@ -276,8 +350,44 @@ class Control:
                             "err_norm": self.err_norm
                         }
                     )
-                f.write(f"{self.k_fd}\n")
                     
+        except KeyboardInterrupt:
+            self.close_phidget()
+            print(f"Inturrupted by user. Process {__name__} closed.")
+            return
+        
+    def run_smc(self):
+        # rate = rospy.Rate(1000)
+        frame = 0
+        try:
+            self.init_phidget()
+            self.set_phidget_enabled(list(range(16)))
+            clamp_sat_limit = 5.5
+            actuator_sat_limit = 9.9
+            while True:
+                if self.conn.poll():
+                    self.receiver()
+                t = time.monotonic_ns()
+                u = self.smc_1_dof(self.joint_pos[11], self.ref_pos[11])
+                v_fc = np.zeros(16)
+                v_fc[11] = u
+                v_dc = self.dead_zone_compensate(v_fc, 1.2, 0.01)
+                cmd = v_dc
+                cmd = self.min_max_saturation(cmd)
+                cmd = np.clip(cmd, -actuator_sat_limit, actuator_sat_limit)  # saturate command in range of phidget's range
+                self.allocate_cmd(cmd)
+                frame += 1
+                if not self.conn_opp.poll():
+                    self.send_result(
+                        {
+                            "frame": frame,
+                            "cmd": cmd,
+                            "err": err,
+                            "err_i": err_i,
+                            "err_d": err_d,
+                            "err_norm": self.err_norm
+                        }
+                    )
                     
         except KeyboardInterrupt:
             self.close_phidget()
@@ -407,7 +517,6 @@ class Control:
         return res
     
 class Integrator():
-    
     def __init__(self) -> None:
         self.t_prev = None
         self.data_prev = None
@@ -420,6 +529,39 @@ class Integrator():
         self.data_prev = data
         return self.value
     
+class FiniteDiff():
+    def __init__(self):
+        self.t_prev = time.time()
+        self.data_prev = None
+    
+    def update(self, t, data):
+        if self.data_prev is None:
+            diff = np.zeros_like(data)
+        else:
+            diff = (data - self.data_prev) / (t - self.t_prev)
+        self.t_prev = copy.deepcopy(t)
+        self.data_prev = copy.deepcopy(data)
+        return diff
+    
+class FiniteDDiff():
+    def __init__(self) -> None:
+        self.t_prev = time.time()
+        self.t_pprev = time.time()
+        self.data_prev = None
+        self.data_pprev = None
+        
+    def update(self, t, data):
+        if self.data_prev is None:
+            ddiff = np.zeros_like(data)
+        elif self.data_pprev is None:
+            ddiff = np.zeros_like(data)
+        else:
+            ddiff = (data - 2 * self.data_prev - self.data_pprev) / np.average(np.diff([t, self.t_prev, self.t_pprev]))**2
+        self.data_pprev = copy.deepcopy(self.data_prev)
+        self.data_prev = copy.deepcopy(data)
+        self.t_pprev = copy.deepcopy(self.t_prev)
+        self.t_prev = copy.deepcopy(t)
+        return ddiff
 
 if __name__ == "__main__":
     rclpy.init()

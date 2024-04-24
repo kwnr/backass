@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from multiprocessing import Process, Pipe
+from threading import Thread
 import os
 import numpy as np
 import signal
@@ -12,8 +13,8 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_system_default, qos_profile_sensor_data
 
 from std_msgs.msg import Header
-from sensor_msgs.msg import JointState
-from interass.msg import (
+from sensor_msgs.msg import JointState  
+from ass_msgs.msg import (
     Robot2UI,
     Hold,
     Preset,
@@ -29,7 +30,7 @@ import traceback
 
 class Robot(Node):
     def __init__(self):
-        super().__init__("core")
+        super().__init__("ass_core")
 
         # fast pipe sends data everytime when available
         self.sl_fast_pipe, self.sl_fast_pipe_opp = Pipe()
@@ -188,13 +189,17 @@ class Robot(Node):
         self.pose_iter_sub = self.create_subscription(
             PoseIteration,
             "pose_iter",
-            callback=self.cb_pose_iter,
+            callback=self.cb_pose_override,
             qos_profile=qos_profile_system_default,
         )
-        self.pose_iter_enabled = False
-        self.pose_iter_dxl = 0
+        self.pose_override_enabled = False
+        self.pose_override_dxl = 0
 
         self.enable_logging = True
+        
+        # self.th_spin = Thread(target=rclpy.spin, kwargs={'node': self})
+        # self.th_spin.start()
+        
         if True:
             header = (
                 ["timestamp"]
@@ -274,54 +279,54 @@ class Robot(Node):
     def cb_ms_state(self, data: ArmMasterCommInt):
         ms_joint_state = np.array(
             [
-                data.L1,
-                data.L2,
-                data.L3,
-                data.L4,
-                data.L5,
-                data.L6,
+                data.l1,
+                data.l2,
+                data.l3,
+                data.l4,
+                data.l5,
+                data.l6,
                 self.ms_state["joint_pos"][6],
                 self.ms_state["joint_pos"][7],  # L7~8
-                data.R1,
-                data.R2,
-                data.R3,
-                data.R4,
-                data.R5,
-                data.R6,
+                data.r1,
+                data.r2,
+                data.r3,
+                data.r4,
+                data.r5,
+                data.r6,
                 self.ms_state["joint_pos"][14],
                 self.ms_state["joint_pos"][15],
             ]
         )  # R7~8
-        if data.L7 != 0:  # if master l7 lever is not zero
+        if data.l7 != 0:  # if master l7 lever is not zero
             ms_joint_state[6] = self.sl_state["joint_pos"][6]  # ref pos is slave's pos
-            self.cmd_override[6] = data.L7 * 3  # overrides cmd value to 3
+            self.cmd_override[6] = data.l7 * 3  # overrides cmd value to 3
             self.flag_is_hold[6] = False  # this axis is not held
         elif not self.flag_is_hold[6]:  # if master l7 lever is zero and is not held
             ms_joint_state[6] = self.sl_state["joint_pos"][6]  # ref pos is slave's pos
             self.cmd_override[6] = np.nan  # not overrides cmd value
             self.flag_is_hold[6] = True  # this axis is held
 
-        if data.L8 != 0:
+        if data.l8 != 0:
             ms_joint_state[7] = self.sl_state["joint_pos"][7]
-            self.cmd_override[7] = data.L8 * 3
+            self.cmd_override[7] = data.l8 * 3
             self.flag_is_hold[7] = False
         elif not self.flag_is_hold[7]:
             ms_joint_state[7] = self.sl_state["joint_pos"][7]
             self.cmd_override[7] = np.nan
             self.flag_is_hold[7] = True
 
-        if data.R7 != 0:
+        if data.r7 != 0:
             ms_joint_state[14] = self.sl_state["joint_pos"][14]
-            self.cmd_override[14] = 3 * data.R7
+            self.cmd_override[14] = 3 * data.r7
             self.flag_is_hold[14] = False
         elif not self.flag_is_hold[14]:
             ms_joint_state[14] = self.sl_state["joint_pos"][14]
             self.cmd_override[14] = np.nan
             self.flag_is_hold[14] = True
 
-        if data.R8 != 0:
+        if data.r8 != 0:
             ms_joint_state[15] = self.sl_state["joint_pos"][15]
-            self.cmd_override[15] = 3 * data.R8
+            self.cmd_override[15] = 3 * data.r8
             self.flag_is_hold[15] = False
         elif not self.flag_is_hold[15]:
             ms_joint_state[15] = self.sl_state["joint_pos"][15]
@@ -339,11 +344,11 @@ class Robot(Node):
             self.ms_state["joint_pos"] = pos_now
             self.is_ref_init = True
 
-    def cb_pose_iter(self, data: PoseIteration):
-        self.pose_iter_enabled = data.enabled
-        self.pose_iter_pose = data.poses[:16]
+    def cb_pose_override(self, data: PoseIteration):
+        self.pose_override_enabled = data.enabled
+        self.pose_override_pose = data.poses[:16]
         # FIXME
-        self.pose_iter_dxl = data.trigger
+        self.pose_override_dxl = data.trigger
 
     def sigint_handler(self, signum, frame):
         raise KeyboardInterrupt
@@ -413,7 +418,7 @@ class Robot(Node):
         ms_joint_pos = np.zeros(16)
         while True:
             try:
-                rclpy.spin_once(self, timeout_sec=0)
+                rclpy.spin_once(self)
                 t_ros = self.get_clock().now()
                 # if self.ms_conn_p.poll():
                 #    self.ms_state = self.ms_conn_p.recv()
@@ -432,14 +437,14 @@ class Robot(Node):
                 if self.is_preset_mode:
                     ms_state["joint_pos"] = self.preset_pos
 
-                if self.pose_iter_enabled:
-                    ms_state["joint_pos"] = self.pose_iter_pose
+                if self.pose_override_enabled:
+                    ms_state["joint_pos"] = self.pose_override_pose
                     is_on_hold = np.where(
-                        np.isnan(self.pose_iter_pose), True, is_on_hold
+                        np.isnan(self.pose_override_pose), True, is_on_hold
                     )
                     ms_state["lift_cmd"][1] = 1
                     ms_state["track_cmd"][1] = (
-                        self.pose_iter_dxl * 5 + 500 if self.pose_iter_dxl != -1 else -1
+                        self.pose_override_dxl * 5 + 500 if self.pose_override_dxl != -1 else -1
                     )
 
                 ms_joint_pos = (
@@ -457,6 +462,7 @@ class Robot(Node):
                 )
 
                 ms_state["joint_pos"] = ms_joint_pos
+                self.ref_pos = ms_state["joint_pos"]
                 self.is_on_hold_prev = is_on_hold
 
                 smooth_factor = np.clip(
