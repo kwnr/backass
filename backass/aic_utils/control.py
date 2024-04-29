@@ -217,7 +217,7 @@ class Control:
                          
     @staticmethod      
     def flow_distributer(vd: np.ndarray, Q_j, Q_h):
-        k_fd = np.divide(Q_h, Q_j.sum()+1.35, out=np.zeros(1), where=Q_j.sum()!=0)
+        k_fd = np.divide(Q_h, Q_j.sum(), out=np.zeros(1), where=Q_j.sum()!=0)
         v_fd = np.multiply(vd, k_fd, out=vd, where=k_fd<1)
         return v_fd
         
@@ -306,7 +306,7 @@ class Control:
         s = c * e - e_dot
         u = M @ (c * e_dot + des_q_ddot - f_x + D * np.sign(s))
         # print(f"{c.flatten()} * {e_dot.flatten()} + {des_q_ddot.flatten()} - {f_x.flatten()}")
-        print(u.flatten())
+        # print(u.flatten())
         return u
     
     def run(self):
@@ -320,13 +320,15 @@ class Control:
                 if self.conn.poll():
                     self.receiver()
                 t = time.monotonic_ns()
-                # u = self.smc_1_dof(t, self.joint_pos[11], self.ref_pos[11])
+                u = self.smc_1_dof(t, self.joint_pos[11], self.ref_pos[11])
+                # print("u:")
+                # print(u)
                 err = self.err_calc()
                 err = err * [1, 1, 1, 1, -1, 1, 1, 1,
                              1, 1, 1, 1, -1, 1, 1, 1,]
                 err_i = self.err_i_calc(t, err)
                 err_d = self.err_d_calc(t, err)
-                vd = err * self.kp + err_i * self.ki + err_d * self.kd + self.sliding_mode_controller(err, err_d)
+                vd = err * self.kp + err_i * self.ki + err_d * self.kd # + self.sliding_mode_controller(err, err_d)
                 vd_sat = self.joint_saturator(vd)
                 self.is_clamp = (vd_sat != vd) & (np.sign(vd) == np.sign(err))
                 Q_j_est = self.joint_flow_estimator(vd_sat)

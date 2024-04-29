@@ -8,10 +8,13 @@ import copy
 import time
 
 from typing import List, Union, TypedDict
+
+from Phidget22.Devices.TemperatureSensor import TemperatureSensor
+from Phidget22.PhidgetException import PhidgetException
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_system_default, qos_profile_sensor_data
-
 from std_msgs.msg import Header
 from sensor_msgs.msg import JointState  
 from ass_msgs.msg import (
@@ -122,7 +125,8 @@ class Robot(Node):
             "act_rpm": 0,
             "des_rpm": 0,
             "des_cur": 0.0,
-            "temp": 0.0,
+            "elmo_temp": 0.0,
+            "phidget_temp": 0.0,
             "frame": 0,
         }
 
@@ -200,7 +204,15 @@ class Robot(Node):
         # self.th_spin = Thread(target=rclpy.spin, kwargs={'node': self})
         # self.th_spin.start()
         
-        if True:
+        try:
+            self.phidget_temp = TemperatureSensor()
+            self.phidget_temp.setChannel(0)
+            self.phidget_temp.openWaitForAttachment(1000)
+        except PhidgetException as e:
+            print(e)
+            self.phidget_temp = None
+        
+        if self.enable_logging:
             header = (
                 ["timestamp"]
                 + [f"L{i} pos" for i in range(1, 9)]
@@ -209,8 +221,10 @@ class Robot(Node):
                 + [f"R{i} ref" for i in range(1, 9)]
                 + [f"L{i} cmd" for i in range(1, 9)]
                 + [f"R{i} cmd" for i in range(1, 9)]
-                + ["FB rpm", "des rpm", "des cur", "temp"]
+                + ["FB rpm", "des rpm", "des cur", "elmo_temp"]
             )
+            if self.phidget_temp is not None:
+                header.append("phidget_temp")
             self.log_dir = os.curdir + "/log/values_log/"
             self.log_name = (
                 self.log_dir + f"log{datetime.now().strftime('%y%m%d%H%M%S')}.csv"
@@ -228,19 +242,19 @@ class Robot(Node):
             *self.ref_pos.tolist(),
             *self.ctrl_state["cmd"].tolist(),
         ]
-        pump_state_str = ",".join(
-            map(
-                "{:.4f}".format,
+        logdata.extend(
                 [
                     self.pump_state["act_rpm"],
                     self.pump_state["des_rpm"],
                     self.pump_state["des_cur"],
-                    self.pump_state["temp"],
+                    self.pump_state["elmo_temp"],
                 ],
             )
-        )
+        if self.phidget_temp is not None: 
+            temp = self.phidget_temp.getTemperature()
+            logdata.append(temp)
         self.log_file.write(
-            ",".join(map("{:.4f}".format, logdata)) + "," + pump_state_str + "\n"
+            ",".join(map("{:.4f}".format, logdata))+"\n"
         )
 
     def start_proc(self):
@@ -535,7 +549,7 @@ class Robot(Node):
                         pump_act_rpm=self.pump_state["act_rpm"],
                         pump_des_rpm=self.pump_state["des_rpm"],
                         pump_des_cur=self.pump_state["des_cur"],
-                        pump_temp=self.pump_state["temp"],
+                        pump_temp=self.pump_state["elmo_temp"],
                         arm_state=self.sl_state["joint_pos"],
                         ref_state=ms_state["joint_pos"],
                         track_left_state=int(ms_state["track_cmd"][0]),

@@ -10,6 +10,7 @@ class Pump:
         except serial.SerialException:
             print("FATAL: Could not open serial")
             raise SystemExit(1)
+            
         self.elmo = Elmo(self.ser)
         self.elmo.write("EC=0;")
         self.elmo.flush()
@@ -31,7 +32,7 @@ class Pump:
         self.act_rpm = 0
         self.des_rpm = 0
         self.des_cur = 0.0
-        self.temp = 0
+        self.elmo_temp = 0.
 
         # pump params
         self.min_rpm = 300
@@ -77,7 +78,7 @@ class Pump:
         self.act_rpm = self.elmo.get_elmo_fb_rpm()
         self.des_rpm = self.elmo.get_elmo_des_rpm()
         self.des_cur = self.elmo.get_elmo_des_cur()
-        self.temp = self.elmo.get_elmo_temp()
+        self.elmo_temp = self.elmo.get_elmo_temp()
 
     def run(self):
         frame = 0
@@ -120,7 +121,7 @@ class Pump:
                             "act_rpm": self.act_rpm,
                             "des_rpm": self.des_rpm,
                             "des_cur": self.des_cur,
-                            "temp": self.temp,
+                            "elmo_temp": self.elmo_temp,
                         }
                     )
 
