@@ -7,6 +7,7 @@ from rclpy.node import Node
 from Phidget22.Devices import VoltageOutput
 from Phidget22 import ErrorCode
 from Phidget22 import PhidgetException
+from Phidget22 import Phidget
 
 import copy
 
@@ -49,7 +50,6 @@ class Control:
         
         self.smooth_factor = np.ones(16)
         self.is_clamp = np.array([False] * 16)
-        
         
         self.joint_power = np.ones(16)
         self.joint_pos = np.ones(16)
@@ -97,13 +97,16 @@ class Control:
             for ch in range(4):
                 self.phidget_1002[ch].setDeviceSerialNumber(525285)  # L1~L4
                 self.phidget_1002[ch].setChannel(ch)
-                self.phidget_1002[ch].openWaitForAttachment(5000)
+                self.phidget_1002[ch].openWaitForAttachment(50000)
+                    
                 self.phidget_1002[ch+4].setDeviceSerialNumber(525266)  # L5~L8
                 self.phidget_1002[ch+4].setChannel(ch)
                 self.phidget_1002[ch+4].openWaitForAttachment(5000)
+                    
                 self.phidget_1002[ch+8].setDeviceSerialNumber(525068)  # R1~R4
                 self.phidget_1002[ch+8].setChannel(ch)
                 self.phidget_1002[ch+8].openWaitForAttachment(5000)  # 연결을 5000ms 까지 대기함
+                    
                 self.phidget_1002[ch+12].setDeviceSerialNumber(525324)  # R5~R8
                 self.phidget_1002[ch+12].setChannel(ch)
                 self.phidget_1002[ch+12].openWaitForAttachment(5000)
@@ -111,6 +114,8 @@ class Control:
         except VoltageOutput.PhidgetException as e:
             print("PHIDGET_ERR ", e)
             print("Fail to initiate Phidget board... closing control...")
+            exit(1002)
+
         except Exception as e:
             print(traceback.format_exc())
             print(e)
@@ -121,6 +126,7 @@ class Control:
             self.phidget_1002[ch+4].close()
             self.phidget_1002[ch+8].close()
             self.phidget_1002[ch+12].close()
+        Phidget.Phidget.finalize(0)
 
     def receiver(self):
         items = self.conn.recv()

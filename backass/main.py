@@ -11,6 +11,7 @@ from typing import List, Union, TypedDict
 
 from Phidget22.Devices.TemperatureSensor import TemperatureSensor
 from Phidget22.PhidgetException import PhidgetException
+from Phidget22.Phidget import Phidget
 
 import rclpy
 from rclpy.node import Node
@@ -25,7 +26,7 @@ from ass_msgs.msg import (
     PoseIteration,
     ArmMasterCommInt,
 )
-from aic_utils import control, pump, sensor_read, dxl_control
+import control, pump, sensor_read, dxl_control
 
 from datetime import datetime
 import traceback
@@ -34,6 +35,8 @@ import traceback
 class Robot(Node):
     def __init__(self):
         super().__init__("ass_core")
+        
+        Phidget.resetLibrary()
 
         # fast pipe sends data everytime when available
         self.sl_fast_pipe, self.sl_fast_pipe_opp = Pipe()
@@ -201,16 +204,17 @@ class Robot(Node):
 
         self.enable_logging = True
         
-        # self.th_spin = Thread(target=rclpy.spin, kwargs={'node': self})
-        # self.th_spin.start()
+        self.th_spin = Thread(target=rclpy.spin, kwargs={'node': self}, daemon=True)
+        self.th_spin.start()
         
         try:
             self.phidget_temp = TemperatureSensor()
             self.phidget_temp.setChannel(0)
             self.phidget_temp.openWaitForAttachment(1000)
+            print("phidget temperature connected")
         except PhidgetException as e:
             print(e)
-            self.phidget_temp = None
+        self.phidget_temp = None
         
         if self.enable_logging:
             header = (
@@ -428,11 +432,11 @@ class Robot(Node):
 
     def run(self):
         self.start_proc()
-        time_frame = np.array([0, 0, 0, 0])
+        time_frame = np.array([self.get_clock().now().nanoseconds, 0, 0, 0])
         ms_joint_pos = np.zeros(16)
         while True:
             try:
-                rclpy.spin_once(self)
+                #rclpy.spin_once(self)
                 t_ros = self.get_clock().now()
                 # if self.ms_conn_p.poll():
                 #    self.ms_state = self.ms_conn_p.recv()
@@ -596,8 +600,8 @@ class Robot(Node):
         if self.enable_logging:
             self.log_timer.destroy()
             self.log_file.close()
-            self.destroy_node()
             print(f"log{datetime.now().strftime('%y%m%d%H%M%S')}.csv saved")
+        self.destroy_node()
         exit(0)
 
 

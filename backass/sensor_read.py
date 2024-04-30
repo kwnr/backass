@@ -11,7 +11,7 @@ from multiprocessing.connection import Connection
 
 class SensorRead:
     def __init__(self, pipeset: List[Connection], port_name="/dev/ttyCUI"):
-        self.ser = serial.rs485.RS485(port_name, baudrate=2000000, timeout=0.5)
+        self.ser = serial.rs485.RS485(port_name, baudrate=2000000, timeout=0.01)
         left_cui_addr = [b'\x6C', b'\x7C', b'\x8C', b'\x9C',
                          b'\xAC', b'\xBC', b'\xEC', b'\xFC']  # L1 to 8
         right_cui_addr = [b'\x0C', b'\x1C', b'\x2C', b'\x3C',
