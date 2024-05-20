@@ -1,5 +1,6 @@
 import dynamixel_sdk
 import numpy as np
+from rclpy.node import Node
 
 # TODO make write function for dxl
 
@@ -27,7 +28,7 @@ POS_DXL_MAX = np.array([500, 2260, 2800, 2000])
 
 
 class DXLControl:
-    def __init__(self, pipeset):
+    def __init__(self, pipeset, parent_node: Node):
         self.conn = pipeset[0]
         self.conn_opp = pipeset[1]
         self.conn_slow = pipeset[2]
@@ -130,7 +131,7 @@ class DXLControl:
 
 if __name__ == "__main__":
     from multiprocessing import Pipe
-
+    node = Node("dxl")
     m, o = Pipe()
-    dxl = DXLControl([m, o] * 3)
+    dxl = DXLControl([m, o] * 3, node)
     dxl.run()

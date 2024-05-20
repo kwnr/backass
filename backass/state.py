@@ -1,23 +1,30 @@
 import time
 from typing import List
+
 import serial
 import serial.rs485
+
 import numpy as np
+
 import rclpy
 from rclpy.node import Node
-import traceback
+from sensor_msgs.msg import JointState
+
 from multiprocessing.connection import Connection
+
+from utils import *
+import traceback
 
 
 class SensorRead:
-    def __init__(self, pipeset: List[Connection], port_name="/dev/ttyCUI"):
+    def __init__(self, pipeset: List[Connection], parent_node: Node, port_name="/dev/ttyCUI"):
         self.ser = serial.rs485.RS485(port_name, baudrate=2000000, timeout=0.01)
         left_cui_addr = [b'\x6C', b'\x7C', b'\x8C', b'\x9C',
                          b'\xAC', b'\xBC', b'\xEC', b'\xFC']  # L1 to 8
         right_cui_addr = [b'\x0C', b'\x1C', b'\x2C', b'\x3C',
                           b'\x4C', b'\x5C', b'\xCC', b'\xDC']  # R1 to 8
         self.cui_addr = left_cui_addr + right_cui_addr
-        self.cui_value = np.zeros(16, dtype=float)
+        self.joint_pos = JointPosition()
 
         self.conn = pipeset[0]
         self.conn_opp = pipeset[1]
@@ -32,10 +39,14 @@ class SensorRead:
 
     def run(self):
         frame = 0
-        nf = NoiseFilter()
-        nf.prev = self.read_one_by_one()
+        lpf = LowPassFilter(1, 1/100)
+        timestamp_prev = time.perf_counter()
+        
         while True:
             try:
+                timestamp = time.perf_counter()
+                dt = timestamp - timestamp_prev
+                timestamp_prev = timestamp
                 if self.conn_pause.poll():
                     res = self.conn_pause.recv()
                     if res == "PAUSE":
@@ -43,13 +54,17 @@ class SensorRead:
                         if res == "RESUME":
                             pass
 
-                self.cui_value = self.read()
-                if self.cui_value is None:
-                    pass
+                joint_pos = self.read()
+                if joint_pos is None:
+                    continue
                 elif not self.conn_opp.poll():
-                    frame += 1
-                    # self.cui_value = nf.update(self.cui_value)
-                    self.conn.send({"joint_pos": self.cui_value, "frame": frame})
+                    frame += 1                    
+                    joint_pos = lpf.filter(joint_pos)
+                    self.joint_pos.append(joint_pos)
+                    self.conn.send({"joint_pos": self.joint_pos.pos,
+                                    "joint_vel": self.joint_pos.vel,
+                                    "joint_acc": self.joint_pos.acc,
+                                    "frame": frame})
 
             except KeyboardInterrupt:
                 print(f"Inturrupted by user. Process {__name__} closed.")
@@ -121,26 +136,8 @@ class SensorRead:
         ).all()
 
 
-class NoiseFilter:
-    def __init__(self) -> None:
-        self.prev = np.zeros(16)
-        self.threshold = 2
-        self.is_prev_initialized = False
 
-    def update(self, value):
-        if not self.is_prev_initialized:
-            self.prev = value
-            self.is_prev_initialized = True
-        to_filter = abs((value - self.prev)) > self.threshold
-        res = self.prev * to_filter + value * np.logical_not(to_filter)
-        """ if any(to_filter):
-            print(f"from index {np.where(to_filter)}")
-            print(f"{value[to_filter]} is ignored")
-            print(f"{self.prev[to_filter]} used instead")
-            print(f"result is : {res}") """
-        self.prev = res
-        return res
-
+        
 
 if __name__ == "__main__":
     from multiprocessing.connection import Pipe

@@ -7,7 +7,7 @@ import signal
 import copy
 import time
 
-from typing import List, Union, TypedDict
+from typing import Union 
 
 from Phidget22.Devices.TemperatureSensor import TemperatureSensor
 from Phidget22.PhidgetException import PhidgetException
@@ -17,7 +17,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_system_default, qos_profile_sensor_data
 from std_msgs.msg import Header
-from sensor_msgs.msg import JointState  
+from sensor_msgs.msg import JointState
 from ass_msgs.msg import (
     Robot2UI,
     Hold,
@@ -26,7 +26,8 @@ from ass_msgs.msg import (
     PoseIteration,
     ArmMasterCommInt,
 )
-import control, pump, sensor_read, dxl_control
+import control, pump, state, dxl_control
+from utils import *
 
 from datetime import datetime
 import traceback
@@ -35,7 +36,9 @@ import traceback
 class Robot(Node):
     def __init__(self):
         super().__init__("ass_core")
-        
+        self.get_logger().set_level(10)
+        self.get_logger().info(f"logging level set to {self.get_logger().get_effective_level()}")
+
         Phidget.resetLibrary()
 
         # fast pipe sends data everytime when available
@@ -92,10 +95,10 @@ class Robot(Node):
             self.dxl_fast_pipe,
         ]
 
-        self.sl_handle = sensor_read.SensorRead(pipeset_sl)
-        self.ctrl_handle = control.Control(pipeset_ctrl)
-        self.pump_handle = pump.Pump(pipeset_pump)
-        self.dxl_handle = dxl_control.DXLControl(pipeset_dxl)
+        self.sl_handle = state.SensorRead(pipeset_sl, self)
+        self.ctrl_handle = control.Control(pipeset_ctrl, self)
+        self.pump_handle = pump.Pump(pipeset_pump, self)
+        self.dxl_handle = dxl_control.DXLControl(pipeset_dxl, self)
 
         self.sl_proc_handle = Process(target=self.sl_handle.run, daemon=True)
         self.ctrl_proc_handle = Process(target=self.ctrl_handle.run, daemon=True)
@@ -103,7 +106,6 @@ class Robot(Node):
         self.dxl_proc_handle = Process(target=self.dxl_handle.run, daemon=True)
 
         signal.signal(signal.SIGINT, self.sigint_handler)
-        print(os.getpid())
 
         self.mask = np.array([False] * 16).reshape(2, 8)
         self.ms_state = {
@@ -112,7 +114,12 @@ class Robot(Node):
             "lift_cmd": np.zeros(2),
             "frame": 0,
         }
-        self.sl_state = {"joint_pos": np.zeros(16, dtype=float), "frame": 0}
+        self.sl_state = {
+            "joint_pos": np.zeros(16, dtype=float),
+            "joint_vel": np.zeros(16, dtype=float),
+            "joint_acc": np.zeros(16, dtype=float),
+            "frame": 0,
+        }
         self.ctrl_state = {
             "cmd": np.zeros(16, dtype=float),
             "err": np.zeros(16, dtype=float),
@@ -121,8 +128,8 @@ class Robot(Node):
             "err_norm": 0.0,
             "frame": 0,
         }
-        self.ms_state[3] = 20
-        self.ms_state[10] = 20
+        self.ms_state["joint_pos"][3] = 20
+        self.ms_state["joint_pos"][10] = 20
         self.ref_pos = np.zeros(16, dtype=float)
         self.pump_state = {
             "act_rpm": 0,
@@ -149,7 +156,7 @@ class Robot(Node):
         )
 
         self.moveit_pub = self.create_publisher(
-            JointState, "joint_state", qos_profile_system_default
+            JointState, "joint_states", qos_profile_system_default
         )
         self.hold_sub = self.create_subscription(
             Hold,
@@ -203,19 +210,22 @@ class Robot(Node):
         self.pose_override_dxl = 0
 
         self.enable_logging = True
-        
-        self.th_spin = Thread(target=rclpy.spin, kwargs={'node': self}, daemon=True)
+
+        self.th_spin = Thread(target=rclpy.spin, kwargs={"node": self}, daemon=True)
         self.th_spin.start()
-        
+
+        self.phidget_temp = TemperatureSensor()
         try:
-            self.phidget_temp = TemperatureSensor()
             self.phidget_temp.setChannel(0)
             self.phidget_temp.openWaitForAttachment(1000)
-            print("phidget temperature connected")
+            self.get_logger().info("phidget temperature connected")
         except PhidgetException as e:
-            print(e)
-        self.phidget_temp = None
-        
+            self.get_logger().warn(f"{e}")
+            self.phidget_temp.close()
+            self.phidget_temp.resetLibrary()
+            self.phidget_temp = None
+            
+
         if self.enable_logging:
             header = (
                 ["timestamp"]
@@ -247,19 +257,17 @@ class Robot(Node):
             *self.ctrl_state["cmd"].tolist(),
         ]
         logdata.extend(
-                [
-                    self.pump_state["act_rpm"],
-                    self.pump_state["des_rpm"],
-                    self.pump_state["des_cur"],
-                    self.pump_state["elmo_temp"],
-                ],
-            )
-        if self.phidget_temp is not None: 
+            [
+                self.pump_state["act_rpm"],
+                self.pump_state["des_rpm"],
+                self.pump_state["des_cur"],
+                self.pump_state["elmo_temp"],
+            ],
+        )
+        if self.phidget_temp is not None:
             temp = self.phidget_temp.getTemperature()
             logdata.append(temp)
-        self.log_file.write(
-            ",".join(map("{:.4f}".format, logdata))+"\n"
-        )
+        self.log_file.write(",".join(map("{:.4f}".format, logdata)) + "\n")
 
     def start_proc(self):
         # self.ms_proc_handle.start()
@@ -267,9 +275,9 @@ class Robot(Node):
         self.ctrl_proc_handle.start()
         self.pump_proc_handle.start()
         self.dxl_proc_handle.start()
-        print(f"proc::state started with pid {self.sl_proc_handle.pid}")
-        print(f"proc::control started with pid {self.ctrl_proc_handle.pid}")
-        print(f"proc::pump started with pid {self.pump_proc_handle.pid}")
+        self.get_logger().info(f"proc::state started with pid {self.sl_proc_handle.pid}")
+        self.get_logger().info(f"proc::control started with pid {self.ctrl_proc_handle.pid}")
+        self.get_logger().info(f"proc::pump started with pid {self.pump_proc_handle.pid}")
 
     def stop_proc(self):
         self.sl_proc_handle.terminate()
@@ -292,7 +300,7 @@ class Robot(Node):
     def cb_preset_sub(self, data: Preset):
         self.is_preset_mode = data.enabled
         self.preset_pos = np.array(data.preset_pos)
-        print(self.is_preset_mode, self.preset_pos)
+        self.get_logger().info(f"{self.is_preset_mode, self.preset_pos}")
 
     def cb_ms_state(self, data: ArmMasterCommInt):
         ms_joint_state = np.array(
@@ -416,7 +424,6 @@ class Robot(Node):
             while True:
                 sl_state = self.sl_fast_pipe.recv()
                 diff = sl_state["joint_pos"][i] - sl_state_prev["joint_pos"][i]
-                diff
                 if self.is_homed(i):
                     break
             self.sl_pause_pipe.send("PAUSE")
@@ -436,7 +443,7 @@ class Robot(Node):
         ms_joint_pos = np.zeros(16)
         while True:
             try:
-                #rclpy.spin_once(self)
+                # rclpy.spin_once(self)
                 t_ros = self.get_clock().now()
                 # if self.ms_conn_p.poll():
                 #    self.ms_state = self.ms_conn_p.recv()
@@ -451,7 +458,7 @@ class Robot(Node):
                 is_on_hold = self.is_on_hold
                 ui_state = self.ui_state
                 ms_state = copy.deepcopy(self.ms_state)
-
+                
                 if self.is_preset_mode:
                     ms_state["joint_pos"] = self.preset_pos
 
@@ -462,7 +469,9 @@ class Robot(Node):
                     )
                     ms_state["lift_cmd"][1] = 1
                     ms_state["track_cmd"][1] = (
-                        self.pose_override_dxl * 5 + 500 if self.pose_override_dxl != -1 else -1
+                        self.pose_override_dxl * 5 + 500
+                        if self.pose_override_dxl != -1
+                        else -1
                     )
 
                 ms_joint_pos = (
@@ -486,11 +495,12 @@ class Robot(Node):
                 smooth_factor = np.clip(
                     (t_ros.nanoseconds // 1e9 - self.joint_when_on) / 2, 0, 1
                 )
-
                 ctrl_cmd: CtrlCommand = {
                     "joint_pos": self.sl_state["joint_pos"],
+                    "joint_vel": self.sl_state["joint_vel"],
+                    "joint_acc": self.sl_state["joint_acc"],
                     "ref_pos": ms_state["joint_pos"],
-                    "joint_power": ui_state.joint_power,
+                    "joint_power": list(ui_state.joint_power),
                     "smooth_factor": smooth_factor,
                     "cmd_override": self.cmd_override,
                     "max_rpm": ui_state.pump_max_rpm,
@@ -566,6 +576,45 @@ class Robot(Node):
                         freq=freq,
                     )
                 )
+                joint_state = JointState()
+                joint_state.name = [
+                    "joint1_left",
+                    "joint2_left",
+                    "joint3_left",
+                    "joint4_left",
+                    "joint5_left",
+                    "joint6_left",
+                    "joint7r_1_left",
+                    "joint7r_left",
+                    "joint7r_2_left",
+                    "joint7l_1_left",
+                    "joint7l_left",
+                    "joint7l_2_left",
+                    "joint8_left",
+                    "joint1_right",
+                    "joint2_right",
+                    "joint3_right",
+                    "joint4_right",
+                    "joint5_right",
+                    "joint6_right",
+                    "joint7r_1_right",
+                    "joint7r_right",
+                    "joint7r_2_right",
+                    "joint7l_1_right",
+                    "joint7l_right",
+                    "joint7l_2_right",
+                    "joint8_right",
+                ]
+                joint_pos = np.deg2rad(self.sl_state["joint_pos"])
+                joint_pos = np.insert(joint_pos, 6, [joint_pos[6]] * 5)
+                joint_pos = np.insert(joint_pos, -2, [joint_pos[-2]] * 5)
+                joint_vel = np.deg2rad(self.sl_state["joint_vel"])
+                joint_vel = np.insert(joint_vel, 6, [joint_vel[6]] * 5)
+                joint_vel = np.insert(joint_vel, -2, [joint_vel[-2]] * 5)
+                joint_pos = joint_pos * ([1, 1, 1, 1, 1, 1, 1, -1, 1, -1, 1, -1, 1] * 2)
+                joint_state.position = joint_pos.tolist()
+                joint_state.velocity = joint_vel.tolist()
+                self.moveit_pub.publish(joint_state)
 
                 sl_proc_exitcode = self.sl_proc_handle.exitcode
                 ctrl_proc_exitcode = self.ctrl_proc_handle.exitcode
@@ -586,11 +635,11 @@ class Robot(Node):
                     )
 
             except KeyboardInterrupt:
-                print("interrupting...")
+                self.get_logger().warning("interrupting...")
                 break
             except UserWarning as e:
-                print(traceback.format_exc())
-                print(e)
+                self.get_logger().error(traceback.format_exc())
+                self.get_logger().error(f"{e}")
                 self.log_timer.destroy()
                 self.stop_proc()
                 self.destroy_node()
@@ -605,65 +654,7 @@ class Robot(Node):
         exit(0)
 
 
-class PoseIterator:
-    def __init__(self, poses) -> None:
-        self.converge_criteria = np.array([0.5] * 16)
-        self.is_converged = np.array([False] * 16)
-        self.poses = poses
-
-    def __next__():
-        pass
-
-    def converged(self, position):
-        pass
-
-
-class SlaveState(TypedDict):
-    frame: int
-    joint_pos: np.ndarray
-
-
-class CtrlState(TypedDict):
-    frame: int
-    cmd: np.ndarray
-    err: np.ndarray
-    err_i: np.ndarray
-    err_d: np.ndarray
-    err_norm: float
-
-
-class PumpState(TypedDict):
-    frame: int
-    act_rpm: int
-    des_rpm: int
-    des_cur: float
-    temp: int
-
-
-class CtrlCommand(TypedDict):
-    joint_pos: np.ndarray
-    ref_pos: np.ndarray
-    joint_power: List[bool]
-    smooth_factor: np.ndarray
-    cmd_override: np.ndarray
-    max_rpm: np.ndarray
-
-
-class PumpCommand(TypedDict):
-    power: bool
-    mode: int
-    tgt_rpm: int
-    err_norm: float
-    max_rpm: int
-    min_rpm: int
-    max_err: int
-
-
-class DXLCommand(TypedDict):
-    pos_cmd: np.ndarray
-
-
 if __name__ == "__main__":
-    rclpy.init(domain_id=0)
+    rclpy.init(domain_id=1)
     robot = Robot()
     robot.run()

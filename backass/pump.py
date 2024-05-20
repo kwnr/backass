@@ -1,16 +1,18 @@
 import serial
 import serial.rs485
 import numpy as np
+from rclpy.node import Node
 
 
 class Pump:
-    def __init__(self, pipeset):
+    def __init__(self, pipeset, parent_node: Node):
+        self.node = parent_node
         try:
             self.ser = serial.Serial("/dev/ttyELMO", baudrate=115200, timeout=1)
         except serial.SerialException:
             print("FATAL: Could not open serial")
             raise SystemExit(1)
-            
+
         self.elmo = Elmo(self.ser)
         self.elmo.write("EC=0;")
         self.elmo.flush()
@@ -32,7 +34,7 @@ class Pump:
         self.act_rpm = 0
         self.des_rpm = 0
         self.des_cur = 0.0
-        self.elmo_temp = 0.
+        self.elmo_temp = 0.0
 
         # pump params
         self.min_rpm = 300
@@ -46,7 +48,7 @@ class Pump:
 
     def __del__(self):
         self.ser.close()
-        print(f"class {__name__} deleted")
+        self.node.get_logger().warn(f"class {__name__} deleted")
         del self.elmo
 
     def control(self):
@@ -55,13 +57,11 @@ class Pump:
         elif self.mode == 1:  # auto
             if self.err_norm > 100:
                 self.tgt_rpm = self.max_rpm
-                # print(f"auto rpm saturated @ {self.tgt_rpm}")
             else:
                 self.tgt_rpm = (
                     (self.max_rpm - self.min_rpm) // self.max_err * self.err_norm
                 ) + self.min_rpm
                 self.tgt_rpm = np.clip(self.tgt_rpm, self.min_rpm, self.max_rpm)
-                # print(f"auto rpm tgts @ {self.tgt_rpm}")
             self.elmo.set_motor_tgt_rpm(self.tgt_rpm)
         self.elmo.begin_motion()
 
@@ -90,7 +90,7 @@ class Pump:
 
                 if self.power == 1:
                     if not self.has_motor_enabled:
-                        print("MOTOR ON")
+                        self.node.get_logger().info("MOTOR ON")
                         self.elmo.set_motor_on()
                         self.elmo.set_motor_max_acc(self.max_acc)
                         self.elmo.set_motor_max_dec(self.max_dec)
@@ -100,13 +100,12 @@ class Pump:
                         self.has_motor_enabled = True
                         self.has_motor_disabled = False
 
-                    # print(f"err norm: {self.err_norm}")
                     self.control()
                     # rate needs to be specified
 
                 else:
                     if not self.has_motor_disabled:
-                        print("MOTOR OFF")
+                        self.node.get_logger().info("MOTOR OFF")
                         self.elmo.set_motor_tgt_rpm(0)
                         self.elmo.begin_motion()
                         self.elmo.set_motor_off()
@@ -128,7 +127,9 @@ class Pump:
             self.elmo.set_motor_off()
         except KeyboardInterrupt:
             self.elmo.set_motor_off()
-            print(f"Inturrupted by user. Process {__name__} closed.")
+            self.node.get_logger().warn(
+                f"Inturrupted by user. Process {__name__} closed."
+            )
             return
 
 
@@ -176,7 +177,6 @@ class Elmo:
         fb2 = self.ser.read_until(b";").decode()
         feedback = fb1 + fb2
         self.ser.flush()
-        # print(f"feedback for command {command}: {feedback}")
         if "?" in feedback:
             print(feedback)
             self.ser.write(b"EC;")
@@ -215,6 +215,7 @@ class Elmo:
 if __name__ == "__main__":
     from multiprocessing.connection import Pipe
 
+    node = Node("HPU_Elmo")
     p1, p2 = Pipe()
-    pump = Pump(p1, p2)
+    pump = Pump([p1, p2] * 3, node)
     pump.run()

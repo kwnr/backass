@@ -1,8 +1,6 @@
 from multiprocessing import Process, Pipe
 import numpy as np
 import time
-import rclpy
-from rclpy.node import Node
 
 from Phidget22.Devices import VoltageOutput
 from Phidget22 import ErrorCode
@@ -19,11 +17,12 @@ from rclpy.node import Node
 import rclpy.time
 import rclpy.timer
 
+
 class Control:
-    def __init__(self, pipeset):
-        self.node = Node("ctrl")
-        
-        print("Initializing Control Process...")
+    def __init__(self, pipeset, parent_node: Node):
+        self.node = parent_node
+        self.node.get_logger().info("Initializing Control Process...")
+        self.node.get_logger().set_level(10)
         self.conn = pipeset[0]
         self.conn_opp = pipeset[1]
         self.conn_slow = pipeset[2]
@@ -47,46 +46,115 @@ class Control:
         self._err_i_log: np.ndarray = np.zeros((self.log_i_size, 16))
         self._err_d_log: np.ndarray = np.zeros((self.log_size, 16))
         self._timestamp: np.ndarray = np.arange(self.log_size).reshape(self.log_size, 1)
-        
+
         self.smooth_factor = np.ones(16)
         self.is_clamp = np.array([False] * 16)
-        
+
         self.joint_power = np.ones(16)
-        self.joint_pos = np.ones(16)
+        self.joint_pos = np.zeros(16, float)
+        self.joint_vel = np.zeros(16, float)
+        self.joint_acc = np.zeros(16, float)
+
         self.ref_pos = np.ones(16)
         self.smooth_factor = np.ones(16)
-        self.cmd_override = np.array([np.nan]*16, dtype=float)
+        self.cmd_override = np.array([np.nan] * 16, dtype=float)
         self.max_rpm = 0
         self.des_rpm = 0
 
-        self.err_norm = 0.
-        
+        self.err_norm = 0.0
+
         self.phidget_retry_counter = 1
-                
-        self.joint_min = np.array([-1000, -1000, -1000, -1000, -1000, -1000, -1000, -1000,
-                                   -1000, -1000, -1000, -1000, -1000, -1000, -1000, -1000])
-        self.joint_max = np.array([1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
-                                   1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000])
-        
+
+        self.joint_min = np.array(
+            [
+                -1000,
+                -1000,
+                -1000,
+                -1000,
+                -1000,
+                -1000,
+                -1000,
+                -1000,
+                -1000,
+                -1000,
+                -1000,
+                -1000,
+                -1000,
+                -1000,
+                -1000,
+                -1000,
+            ]
+        )
+        self.joint_max = np.array(
+            [
+                1000,
+                1000,
+                1000,
+                1000,
+                1000,
+                1000,
+                1000,
+                1000,
+                1000,
+                1000,
+                1000,
+                1000,
+                1000,
+                1000,
+                1000,
+                1000,
+            ]
+        )
+
         # 34.1, -56
         # 34.2, -46
 
-        self.kp = np.array([.25*2, .25*2, .5, .5, .5, .5, .5, .5*2,] * 2)
-        self.ki = np.array([.0125/2, .0125/2, .0125/4, .0125/2, .0125*2, .0125/2, .0125/2, .0125]*2)
-        self.kd = np.array([1/2, 1/2, 2, 1, 2, 1, 1, 1*2] * 2)
+        self.kp = np.array(
+            [
+                0.25 * 2,
+                0.25 * 2,
+                0.5,
+                0.5,
+                0.5,
+                0.5,
+                0.5,
+                0.5 * 2,
+            ]
+            * 2
+        )
+        self.ki = np.array(
+            [
+                0.0125 / 2,
+                0.0125 / 2,
+                0.0125 / 4,
+                0.0125 / 2,
+                0.0125 * 2,
+                0.0125 / 2,
+                0.0125 / 2,
+                0.0125,
+            ]
+            * 2
+        )
+        self.kd = np.array([1 / 2, 1 / 2, 2, 1, 2, 1, 1, 1 * 2] * 2)
         self.integrator = Integrator()
         self.integrator_der = Integrator()
-        
-        self.lpm8_flow = np.polynomial.Polynomial([0, 0.822176, -0.02439, 0.227971, -0.03879, 0.00184])
+        self.st_w = Integrator()
+
+        self.lpm8_flow = np.polynomial.Polynomial(
+            [0, 0.822176, -0.02439, 0.227971, -0.03879, 0.00184]
+        )
         self.lpm4_flow = np.polynomial.Polynomial([0, 0.86869, 0.16426, -0.01125])
-        
+
         self.k_fd = 0
 
         self.q1_diff = FiniteDiff()
         self.q2_diff = FiniteDiff()
         self.e_diff = FiniteDiff()
         self.q_ddiff = FiniteDDiff()
-        
+        self.con_q_integrator = Integrator()
+        self.c1_prev = 0.0
+        self.c2_prev = 0.0
+        self.node.get_logger().info("Control Process Initialized")
 
     def __del__(self):
         self.close_phidget()
@@ -97,41 +165,41 @@ class Control:
             for ch in range(4):
                 self.phidget_1002[ch].setDeviceSerialNumber(525285)  # L1~L4
                 self.phidget_1002[ch].setChannel(ch)
-                self.phidget_1002[ch].openWaitForAttachment(50000)
-                    
-                self.phidget_1002[ch+4].setDeviceSerialNumber(525266)  # L5~L8
-                self.phidget_1002[ch+4].setChannel(ch)
-                self.phidget_1002[ch+4].openWaitForAttachment(5000)
-                    
-                self.phidget_1002[ch+8].setDeviceSerialNumber(525068)  # R1~R4
-                self.phidget_1002[ch+8].setChannel(ch)
-                self.phidget_1002[ch+8].openWaitForAttachment(5000)  # 연결을 5000ms 까지 대기함
-                    
-                self.phidget_1002[ch+12].setDeviceSerialNumber(525324)  # R5~R8
-                self.phidget_1002[ch+12].setChannel(ch)
-                self.phidget_1002[ch+12].openWaitForAttachment(5000)
-                
+                self.phidget_1002[ch].openWaitForAttachment(5000)
+
+                self.phidget_1002[ch + 4].setDeviceSerialNumber(525266)  # L5~L8
+                self.phidget_1002[ch + 4].setChannel(ch)
+                self.phidget_1002[ch + 4].openWaitForAttachment(5000)
+
+                self.phidget_1002[ch + 8].setDeviceSerialNumber(525068)  # R1~R4
+                self.phidget_1002[ch + 8].setChannel(ch)
+                self.phidget_1002[ch + 8].openWaitForAttachment(5000)
+
+                self.phidget_1002[ch + 12].setDeviceSerialNumber(525324)  # R5~R8
+                self.phidget_1002[ch + 12].setChannel(ch)
+                self.phidget_1002[ch + 12].openWaitForAttachment(5000)
+
         except VoltageOutput.PhidgetException as e:
-            print("PHIDGET_ERR ", e)
-            print("Fail to initiate Phidget board... closing control...")
+            self.node.get_logger().fatal(f"PHIDGET_ERR {e}")
+            self.node.get_logger().fatal(
+                "Fail to initiate Phidget board... closing control..."
+            )
             exit(1002)
 
-        except Exception as e:
-            print(traceback.format_exc())
-            print(e)
-            
     def close_phidget(self):
         for ch in range(4):
             self.phidget_1002[ch].close()
-            self.phidget_1002[ch+4].close()
-            self.phidget_1002[ch+8].close()
-            self.phidget_1002[ch+12].close()
+            self.phidget_1002[ch + 4].close()
+            self.phidget_1002[ch + 8].close()
+            self.phidget_1002[ch + 12].close()
         Phidget.Phidget.finalize(0)
 
     def receiver(self):
         items = self.conn.recv()
         self.joint_power = np.array(items["joint_power"])
         self.joint_pos = np.array(items["joint_pos"])
+        self.joint_vel = np.array(items["joint_vel"])
+        self.joint_acc = np.array(items["joint_acc"])
         self.ref_pos = np.array(items["ref_pos"])
         self.smooth_factor = np.array(items["smooth_factor"])
         self.cmd_override = np.array(items["cmd_override"], dtype=float)
@@ -143,108 +211,129 @@ class Control:
 
     def err_calc(self):
         self.err = self.ref_pos - self.joint_pos
-        self.err = (self.err * self.smooth_factor) * self.joint_power * np.isnan(self.cmd_override)
-        self.err_norm = np.linalg.norm(self.err * np.array(
-            [1.73, 0.97, 0.97, 1.73, 0.19, 0.19, 0, 0,
-             1.73, 0.97, 0.97, 1.73, 0.19, 0.19, 0, 0]) * self.joint_power, 1)
-        
+        self.err = (
+            (self.err * self.smooth_factor)
+            * self.joint_power
+            * np.isnan(self.cmd_override)
+        )
+        self.err_norm = np.linalg.norm(
+            self.err
+            * np.array([1.73, 0.97, 0.97, 1.73, 0.19, 0.19, 0, 0] * 2)
+            * self.joint_power,
+            1,
+        )
+
         return self.err
-    
+
     def err_i_calc(self, ns, err):
         err_clamped = err * ~self.is_clamp
-        self.integrator.value *= (self.joint_power * np.isnan(self.cmd_override))
         err_i = self.integrator.update(ns, err_clamped)
+        self.integrator.value *= self.joint_power * np.isnan(self.cmd_override)  # type: ignore
         return err_i
-    
+
     def err_d_calc(self, ns, err, cutoff_freq=0.01):
         es = err - self.integrator_der.value
         err_d = (es * cutoff_freq) * self.joint_power * np.isnan(self.cmd_override)
         self.integrator_der.update(ns, err_d)
         return err_d
-    
+
     def pid_alt(self, err, err_i, err_d):
-        k = .5
+        k = 0.5
         gamma = 5
         kp = 0.7
         ki = 0.1  # kp**2 > 2ki
-        
+
         K = k * np.eye(16)
         KP = kp * np.eye(16)
         KI = ki * np.eye(16)
-        
-        res = (K + 1 / (gamma ** 2) * np.eye(16)) @ (err_d + KP @ err + KI @ err_i)
-                
+
+        res = (K + 1 / (gamma**2) * np.eye(16)) @ (err_d + KP @ err + KI @ err_i)
+
         return res
-    
 
     def allocate_cmd(self, cmd):
         cmd = np.clip(cmd, -9.9, 9.9)
         try:
             for ch in range(4):
                 self.phidget_1002[ch].setVoltage_async(cmd[ch], self.ph_async_cb)
-                self.phidget_1002[ch+4].setVoltage_async(cmd[ch + 4], self.ph_async_cb)
-                self.phidget_1002[ch+8].setVoltage_async(cmd[ch + 8], self.ph_async_cb)
-                self.phidget_1002[ch+12].setVoltage(cmd[ch + 12])
-                
+                self.phidget_1002[ch + 4].setVoltage_async(
+                    cmd[ch + 4], self.ph_async_cb
+                )
+                self.phidget_1002[ch + 8].setVoltage_async(
+                    cmd[ch + 8], self.ph_async_cb
+                )
+                self.phidget_1002[ch + 12].setVoltage(cmd[ch + 12])
+
         except PhidgetException.PhidgetException as e:
-            print(e)
+            self.node.get_logger().error(e)
             t_0 = time.time()
-            print(traceback.format_exc())
-            print(f"retry to reconnect phidget. attempt {self.phidget_retry_counter}")
+            self.node.get_logger().error(traceback.format_exc())
+            self.node.get_logger().error(
+                f"retry to reconnect phidget. attempt {self.phidget_retry_counter}"
+            )
             while time.time() - t_0 < 1:
                 pass
             self.phidget_retry_counter += 1
             self.close_phidget()
             self.init_phidget()
-            
+
     def set_phidget_enabled(self, idx: list):
         for i, phidget in enumerate(self.phidget_1002):
             if i in idx:
                 phidget.setVoltage(0)
                 phidget.setEnabled(True)
-            
+
     def set_phidget_disabled(self, idx: list):
         for i, phidget in enumerate(self.phidget_1002):
             if i in idx:
                 phidget.setVoltage(0)
                 phidget.setEnabled(False)
-                
+
     def joint_flow_estimator(self, v: np.ndarray):
         flow_4 = self.lpm4_flow(v)
         flow_8 = self.lpm8_flow(v)
-        res = abs(np.where([True, False, False, True, False, False, False, False] * 2,
-                        flow_8, flow_4))
+        res = abs(
+            np.where(
+                [True, False, False, True, False, False, False, False] * 2,
+                flow_8,
+                flow_4,
+            )
+        )
         return res
-                
+
     @staticmethod
     def mhpu_flow_estimator(rpm):
         return rpm * 2.7 / 1000
-    
-                         
-    @staticmethod      
+
+    @staticmethod
     def flow_distributer(vd: np.ndarray, Q_j, Q_h):
-        k_fd = np.divide(Q_h, Q_j.sum(), out=np.zeros(1), where=Q_j.sum()!=0)
-        v_fd = np.multiply(vd, k_fd, out=vd, where=k_fd<1)
+        k_fd = np.divide(Q_h, Q_j.sum(), out=np.zeros(1), where=Q_j.sum() != 0)
+        v_fd = np.multiply(vd, k_fd, out=vd, where=k_fd < 1)
         return v_fd
-        
-    
+
     @staticmethod
     def joint_saturator(v):
         pump_4lpm_sat_v = 5.4
         pump_8lpm_sat_v = 3.52
-        
-        v_p_max = np.where([True, False, False, True, False, False, False, False] * 2, pump_8lpm_sat_v, pump_4lpm_sat_v)
-        v_h_max = np.array([3.27, 4.06, 4.06, 3.27, 1.5, 1.5, 1.5, 1.5] * 2) * 1.4  # saturated by hose 
+
+        v_p_max = np.where(
+            [True, False, False, True, False, False, False, False] * 2,
+            pump_8lpm_sat_v,
+            pump_4lpm_sat_v,
+        )
+        v_h_max = (
+            np.array([3.27, 4.06, 4.06, 3.27, 1.5, 1.5, 1.5, 1.5] * 2) * 1.4
+        )  # saturated by hose
         v = np.clip(v, -v_p_max, v_p_max)
         v = np.clip(v, -v_h_max, v_h_max)
         return v
-        
+
     def sliding_mode_controller(self, err, err_d):
         lbd = 0.15
         K_S = self.kp / 100 * 2
         s = K_S * np.sign(lbd * err + err_d)
-        return s                
-    
+        return s
+
     def min_max_saturation(self, cmd):
         is_greater = self.joint_pos >= self.joint_max
         is_lesser = self.joint_pos <= self.joint_min
@@ -254,87 +343,215 @@ class Control:
             if is_lesser[i] and cmd[i] < 0:
                 cmd[i] = 0
         return cmd
+
+    def saturation_s(self, s):
+        phi = 0.04
+        if s >= phi:
+            s = 1
+        elif -phi < s and s < phi:
+            s = s / phi
+        else:
+            s = -1
+        return s
     
-    @staticmethod
-    def CalDynamics(q1,q2,q1_dot,q2_dot):
-        m1 = 4.039 #kg
-        m2 = 5.804 #kg
-        l1 = 0.45 # m
-        l2 = 0.45 # m
+    def super_twisting(self,t,s):
+        U = 0.001
+        lamda = np.sqrt(U)
+        W = 1.1*U
+        w_dot = -W*np.sign(s)
+        print("w_dot:",w_dot)
+        w = self.st_w.update(t*1e9,w_dot)
+        print("w:",w)
+        s = lamda*np.sqrt(np.abs(s))*np.sign(s)-w
+        return s
+
+    def smc_1_dof(self, t, pos, vel, ref):
+        t = t / 1e9
+
+        m1 = 4.472 / 9.81  # kgf
+        m2 = 0.92 / 9.81  # kgf
+        l1 = 0.45  # m
+        l2 = 0.26  # m
         g = 9.81
+
+        l1_base = 0.335
+        l1_rot = 0.08
+        l2_base = 0.173
+        l2_rot = 0.025
+
+        q1_dl_0 = np.deg2rad(76.17)
+        q2_dl_0 = np.deg2rad(109.8)
+
+        q1 = np.deg2rad(-pos[11])
+        q2 = np.deg2rad(pos[13])
+        des_q1 = -np.deg2rad(20)
+        #des_q1 = -np.deg2rad(20*np.sin(2*np.pi*t/10))
+        #des_q2 = np.deg2rad(20*np.sin(2*np.pi*t/8))
+        # des_q1 = -np.deg2rad(-20)
+        des_q2 = np.deg2rad(20)
+        e1 = des_q1 - q1
+        e2 = des_q2 - q2
+
+
+        q1_dot = np.deg2rad(-vel[11])
+        q2_dot = np.deg2rad(vel[13])
+
+        q = np.array([[q1], [q2]])
+        q_dot = np.array([[q1_dot], [q2_dot]])
+        m = np.array([[m1], [m2]])
+        l = np.array([[l1], [l2]])
+        e = np.array([[e1], [e2]])
+
+        M, C, G = self.CalDynamics(q, q_dot, m, l)
+        D = np.array([[0.015], [0.07]])
+
+        g_x = np.linalg.inv(M)
+        f_x = g_x @ (-C * np.array([[q1_dot], [q2_dot]]) - G)
+
+        c = np.array([[0.2], [0.9]])
+        e_dot = self.e_diff.update(t, e)
+        print("e_dot:",e_dot)
         
-        q2 = np.deg2rad(q2)        
+        # des_q_ddot = self.q_ddiff.update(t, np.array([[des_q1], [des_q2]]))
+        des_q_ddot = np.clip(self.q_ddiff.update(t, np.array([[des_q1], [des_q2]])),np.deg2rad(-5),np.deg2rad(5))
+        # des_q_ddot = np.array([[0],[0]])
+        s = c * e + e_dot
+
+        # u = M @ (c * e_dot + des_q_ddot - f_x + D * np.sign(s))
+        #s[0] = self.saturation_s(s[0])
+        s[0] = self.super_twisting(t,s[0])
+        #s[1] = self.saturation_s(s[1])
+        u = M @ (c * e_dot + des_q_ddot - f_x + s)
+        # print("D*s",D*s)
+        # u = M @ (c * e_dot + des_q_ddot - f_x + D * s)
+
+
+        con_q_ddot = np.linalg.solve(M, (u - C * q_dot - G))
+        # con_q_ddot = np.clip(con_q_ddot,np.deg2rad(50),np.deg2rad(50))
+        # con_q_dot = np.clip(con_q_ddot/100,np.deg2rad(-0.5),np.deg2rad(0.5))
+        con_q_dot = np.clip(
+            self.con_q_integrator.update(t*1e9, con_q_ddot),
+            np.deg2rad(-0.5),
+            np.deg2rad(0.5))
         
-        M11 = (m1 + m2) * l2**2 + m2 * l2**2 + 2 * m2 * l1 * l2 * np.cos(q2)
+        # if abs(e[0]) < np.deg2rad(0.03):
+        #     con_q_dot[0] = 0
+        # if abs(e[1]) < np.deg2rad(0.03):
+        #     con_q_dot[1] = 0
+
+
+        dc1_dq = (
+            l1_base
+            * l1_rot
+            * np.sin(q1_dl_0 - q1)
+            / (
+                np.sqrt(
+                    l1_base**2 - 2 * l1_base * l1_rot * np.cos(q1_dl_0 - q1) + l1_rot**2
+                )
+            )
+        )
+        dc2_dq = (
+            l2_base
+            * l2_rot
+            * np.sin(q2_dl_0 - q2)
+            / (
+                np.sqrt(
+                    l2_base**2 - 2 * l2_base * l2_rot * np.cos(q2_dl_0 - q2) + l2_rot**2
+                )
+            )
+        )
+
+        dc1_dt = dc1_dq * -con_q_dot[0]
+        dc2_dt = dc2_dq * con_q_dot[1]
+
+
+        A1_push = 0.1696
+        A1_pull = 0.1272
+        A2_push = 0.0433
+        A2_pull = 0.0353
+
+        Q1 = (
+            A1_push * dc1_dt * (dc1_dt >= 0) + A1_pull * dc1_dt * (dc1_dt < 0)
+        ) * 60000
+        Q2 = (
+            A2_push * dc2_dt * (dc2_dt >= 0) + A2_pull * dc2_dt * (dc2_dt < 0)
+        ) * 60000
+
+        lpm4_vol = np.polynomial.Polynomial([0, 0.7206])
+        lpm8_vol = np.polynomial.Polynomial([0, 0.7361, -0.0408, 0.001])
+        v1 = lpm8_vol(abs(Q1)) * np.sign(Q1)
+        v2 = lpm4_vol(abs(Q2)) * np.sign(Q2)
+
+        print("Start-----------------------------------------------")
+        print("s[0]:",s[0])
+        print("des_q2:" ,-np.rad2deg(des_q1))
+        print("des_q_ddot:" ,np.rad2deg(des_q_ddot[0]))
+        print("con_q_ddot[1]: ",con_q_ddot[0])
+        print("con_q_dot[1]: ",con_q_dot[0])
+        print("v1: ",v1)
+
+
+        return v1, v2
+
+    @staticmethod
+    def CalDynamics(q, q_dot, m, l):
+        g = 9.81
+        q1 = q[0]
+        q2 = q[1]
+        q1_dot = q_dot[0]
+        q2_dot = q_dot[1]
+        m1 = m[0]
+        m2 = m[1]
+        l1 = l[0]
+        l2 = l[1]
+
+        M11 = (m1 + m2) * l1**2 + m2 * l2**2 + 2 * m2 * l1 * l2 * np.cos(q2)
         M12 = m2 * l2**2 + m2 * l1 * l2 * np.cos(q2)
         M21 = M12
         M22 = m2 * l2**2
-        M = np.array([[M11, M12],[M21, M22]])
-        C1 = (-m2 * l1 * l2 * np.sin(q2) * q2_dot 
-              - m2 * l1 * l2 * np.sin(q2) * (q1_dot + q2_dot))
-        C2 = m2*l1*l2*np.sin(q2)*q1_dot
-        C = np.array([[C1],[C2]])
-        G1 = (m1+m2)*g*l1*np.cos(q1)+m2*g*l2*np.cos(q1+q2)
-        G2 = m2*g*l2*np.cos(q1+q2)
-        G = np.array([[G1],[G2]])
-        
+        M = np.array([[M11[0], M12[0]], [M21[0], M22[0]]])
+        C1 = -m2 * l1 * l2 * np.sin(q2) * q2_dot - m2 * l1 * l2 * np.sin(q2) * (
+            q1_dot + q2_dot
+        )
+        C2 = m2 * l1 * l2 * np.sin(q2) * q1_dot
+        C = np.array([[C1[0]], [C2[0]]])
+        G1 = (m1 + m2) * g * l1 * np.cos(q1) + m2 * g * l2 * np.cos(q1 + q2)
+        G2 = m2 * g * l2 * np.cos(q1 + q2)
+        G = np.array([[G1[0]], [G2[0]]])
         return M, C, G
-    
-    def smc_1_dof(self, t, pos, ref):
-        t = t/1e9
-        q1 = np.deg2rad(-90)
-        q2 = np.deg2rad(-(pos-90))
-        des_q1 = np.deg2rad(-90)
-        des_q2 = np.deg2rad(-(ref-90))
-        e1 = des_q1 - q1
-        e2 = des_q2 - q2
-        
-        q1_dot = self.q1_diff.update(t, q1)
-        q2_dot = self.q2_diff.update(t, q2)
-        
-        M, C, G = self.CalDynamics(q1, q2, q1_dot, q2_dot)
-        
-        g_x = np.linalg.inv(M)
-        f_x = g_x@(-C * np.array([[q1_dot],
-                                  [q2_dot]]) - G)
-        
-        q = np.array([[q1],
-                      [q2]])
-        c = np.array([[5],
-                      [5]])
-        e = np.array([[e1],
-                      [e2]])
-        e_dot = self.e_diff.update(t, e)
-        des_q_ddot = self.q_ddiff.update(t, np.array([[des_q1], 
-                                                      [des_q2]]))
-        
-        D = 0
-        s = c * e - e_dot
-        u = M @ (c * e_dot + des_q_ddot - f_x + D * np.sign(s))
-        # print(f"{c.flatten()} * {e_dot.flatten()} + {des_q_ddot.flatten()} - {f_x.flatten()}")
-        # print(u.flatten())
-        return u
-    
+
     def run(self):
         frame = 0
         try:
             self.init_phidget()
             self.set_phidget_enabled(list(range(16)))
+            t = time.monotonic_ns()
+            self.integrator.initialize(t, np.zeros(16))
+            self.integrator_der.initialize(t, np.zeros(16))
             clamp_sat_limit = 5.5
             actuator_sat_limit = 9.9
             while True:
                 if self.conn.poll():
                     self.receiver()
                 t = time.monotonic_ns()
-                u = self.smc_1_dof(t, self.joint_pos[11], self.ref_pos[11])
-                # print("u:")
-                # print(u)
+
+                u = self.smc_1_dof(t, self.joint_pos, self.joint_vel, self.ref_pos)
+                # self.node.get_logger().debug(
+                #     f"{u}",
+                # )
+
                 err = self.err_calc()
-                err = err * [1, 1, 1, 1, -1, 1, 1, 1,
-                             1, 1, 1, 1, -1, 1, 1, 1,]
+                err[4] *= -1
+                err[12] *= -1
                 err_i = self.err_i_calc(t, err)
                 err_d = self.err_d_calc(t, err)
-                vd = err * self.kp + err_i * self.ki + err_d * self.kd # + self.sliding_mode_controller(err, err_d)
+                vd = (
+                    err * self.kp + err_i * self.ki + err_d * self.kd
+                )  #+ self.sliding_mode_controller(err, err_d)
+                vd[11] = u[0]
+                #vd[13] = u[1]
+                # print("vd[11]:",vd[11])
+                # print("vd[13]:",vd[13])
                 vd_sat = self.joint_saturator(vd)
                 self.is_clamp = (vd_sat != vd) & (np.sign(vd) == np.sign(err))
                 Q_j_est = self.joint_flow_estimator(vd_sat)
@@ -342,9 +559,13 @@ class Control:
                 # v_fc = self.flow_distributer(vd_sat, Q_j_est, Q_p_est*1.2)
                 v_dc = self.dead_zone_compensate(vd_sat, 1.2, 0.01)
                 cmd = v_dc
-                cmd[~np.isnan(self.cmd_override)] = self.cmd_override[~np.isnan(self.cmd_override)]
+                cmd[~np.isnan(self.cmd_override)] = self.cmd_override[
+                    ~np.isnan(self.cmd_override)
+                ]
                 cmd = self.min_max_saturation(cmd)
-                cmd = np.clip(cmd, -actuator_sat_limit, actuator_sat_limit)  # saturate command in range of phidget's range
+                cmd = np.clip(
+                    cmd, -actuator_sat_limit, actuator_sat_limit
+                )  # saturate command in range of phidget's range
                 self.allocate_cmd(cmd)
                 frame += 1
                 if not self.conn_opp.poll():
@@ -355,53 +576,14 @@ class Control:
                             "err": err,
                             "err_i": err_i,
                             "err_d": err_d,
-                            "err_norm": self.err_norm
+                            "err_norm": self.err_norm,
                         }
                     )
-                    
-        except KeyboardInterrupt:
-            self.close_phidget()
-            print(f"Inturrupted by user. Process {__name__} closed.")
-            return
-        
-    def run_smc(self):
-        # rate = rospy.Rate(1000)
-        frame = 0
-        try:
-            self.init_phidget()
-            self.set_phidget_enabled(list(range(16)))
-            clamp_sat_limit = 5.5
-            actuator_sat_limit = 9.9
-            while True:
-                if self.conn.poll():
-                    self.receiver()
-                t = time.monotonic_ns()
-                u = self.smc_1_dof(self.joint_pos[11], self.ref_pos[11])
-                v_fc = np.zeros(16)
-                v_fc[11] = u
-                v_dc = self.dead_zone_compensate(v_fc, 1.2, 0.01)
-                cmd = v_dc
-                cmd = self.min_max_saturation(cmd)
-                cmd = np.clip(cmd, -actuator_sat_limit, actuator_sat_limit)  # saturate command in range of phidget's range
-                self.allocate_cmd(cmd)
-                frame += 1
-                if not self.conn_opp.poll():
-                    self.send_result(
-                        {
-                            "frame": frame,
-                            "cmd": cmd,
-                            "err": err,
-                            "err_i": err_i,
-                            "err_d": err_d,
-                            "err_norm": self.err_norm
-                        }
-                    )
-                    
-        except KeyboardInterrupt:
-            self.close_phidget()
-            print(f"Inturrupted by user. Process {__name__} closed.")
-            return
 
+        except KeyboardInterrupt:
+            self.close_phidget()
+            print(f"Inturrupted by user. Process {__name__} closed.")
+            return
 
     @property
     def joint_pos(self):
@@ -412,7 +594,9 @@ class Control:
         if np.shape(value) == (16,):
             self._joint_pos = value
         else:
-            raise ValueError(f"incorrect shape {np.shape(value)}. Shape should be (16,)")
+            raise ValueError(
+                f"incorrect shape {np.shape(value)}. Shape should be (16,)"
+            )
 
     @property
     def ref_pos(self):
@@ -423,7 +607,9 @@ class Control:
         if np.shape(value) == (16,):
             self._ref_pos = value
         else:
-            raise ValueError(f"incorrect shape {np.shape(value)}. Shape should be (16,)")
+            raise ValueError(
+                f"incorrect shape {np.shape(value)}. Shape should be (16,)"
+            )
 
     @property
     def err(self):
@@ -434,7 +620,9 @@ class Control:
         if np.shape(value) == (16,):
             self._err = value
         else:
-            raise ValueError(f"incorrect shape {np.shape(value)} for err. Shape should be (16,)")
+            raise ValueError(
+                f"incorrect shape {np.shape(value)} for err. Shape should be (16,)"
+            )
 
     @property
     def err_i(self):
@@ -445,7 +633,9 @@ class Control:
         if np.shape(value) == (16,):
             self._err_i = value
         else:
-            raise ValueError(f"incorrect shape {np.shape(value)}. Shape should be (16,)")
+            raise ValueError(
+                f"incorrect shape {np.shape(value)}. Shape should be (16,)"
+            )
 
     @property
     def err_d(self):
@@ -456,7 +646,9 @@ class Control:
         if np.shape(value) == (16,):
             self._err_d = value
         else:
-            raise ValueError(f"incorrect shape {np.shape(value)}. Shape should be (16,)")
+            raise ValueError(
+                f"incorrect shape {np.shape(value)}. Shape should be (16,)"
+            )
 
     @property
     def err_log(self):
@@ -467,7 +659,9 @@ class Control:
         if np.shape(value) == (self.log_size, 16):
             self._err_log = value
         else:
-            raise ValueError(f"incorrect shape {np.shape(value)}. Shape should be (self.log_size, 16)")
+            raise ValueError(
+                f"incorrect shape {np.shape(value)}. Shape should be (self.log_size, 16)"
+            )
 
     @property
     def err_i_log(self):
@@ -478,7 +672,9 @@ class Control:
         if np.shape(value) == (self.log_i_size, 16):
             self._err_i_log = value
         else:
-            raise ValueError(f"incorrect shape {np.shape(value)}. Shape should be (self.log_size, 16)")
+            raise ValueError(
+                f"incorrect shape {np.shape(value)}. Shape should be (self.log_size, 16)"
+            )
 
     @property
     def err_d_log(self):
@@ -489,7 +685,9 @@ class Control:
         if np.shape(value) == (self.log_size, 16):
             self._err_d_log = value
         else:
-            raise ValueError(f"incorrect shape {np.shape(value)}. Shape should be (self.log_size, 16)")
+            raise ValueError(
+                f"incorrect shape {np.shape(value)}. Shape should be (self.log_size, 16)"
+            )
 
     @property
     def timestamp(self):
@@ -500,7 +698,9 @@ class Control:
         if np.shape(value) == (self.log_size, 1):
             self._timestamp = value
         else:
-            raise ValueError(f"incorrect shape {np.shape(value)}. Shape should be ({self.log_size, 1})")
+            raise ValueError(
+                f"incorrect shape {np.shape(value)}. Shape should be ({self.log_size, 1})"
+            )
 
     @staticmethod
     def ph_async_cb(ch, res, details):
@@ -519,61 +719,86 @@ class Control:
         return value
 
     @staticmethod
-    def dead_zone_compensate(value: np.ndarray, compensation: float, tol: float) -> np.ndarray:
-        res =  ((value + np.sign(value) * compensation) * (abs(value) > tol) + 
-                (value * (compensation + tol)/tol) * (abs(value) <= tol))
+    def dead_zone_compensate(
+        value: np.ndarray, compensation: float, tol: float
+    ) -> np.ndarray:
+        res = (value + np.sign(value) * compensation) * (abs(value) > tol) + (
+            value * (compensation + tol) / tol
+        ) * (abs(value) <= tol)
         return res
-    
-class Integrator():
+
+
+from typing import Optional
+
+
+class Integrator:
     def __init__(self) -> None:
         self.t_prev = None
         self.data_prev = None
-        self.value = np.zeros(16)
-    
+        self.value: Optional[np.ndarray] = None
+
+    def initialize(self, t, data):
+        self.t_prev = t
+        self.data_prev = data
+        self.value = np.zeros_like(data)
+
     def update(self, t, data):
-        if self.t_prev is not None and self.data_prev is not None:
-            self.value += (t - self.t_prev) * (data + self.data_prev) / 2 / 1e9
+        if self.value is None:
+            self.value = np.zeros_like(data)
+        elif self.t_prev is not None and self.data_prev is not None:
+            self.value = (
+                self.value + (t - self.t_prev) * (data + self.data_prev) / 2/ 1e9
+            )
         self.t_prev = t
         self.data_prev = data
         return self.value
-    
-class FiniteDiff():
+
+
+class FiniteDiff:
     def __init__(self):
-        self.t_prev = time.time()
         self.data_prev = None
-    
+        self.t_prev = time.time()
+
     def update(self, t, data):
         if self.data_prev is None:
+            self.t_prev = copy.deepcopy(t)
             diff = np.zeros_like(data)
         else:
             diff = (data - self.data_prev) / (t - self.t_prev)
+        print("t - self.t_prev",t - self.t_prev)
         self.t_prev = copy.deepcopy(t)
         self.data_prev = copy.deepcopy(data)
         return diff
-    
-class FiniteDDiff():
+
+
+class FiniteDDiff:
     def __init__(self) -> None:
-        self.t_prev = time.time()
-        self.t_pprev = time.time()
         self.data_prev = None
         self.data_pprev = None
-        
+        self.t_prev = time.time()
+        self.t_pprev = time.time()
+
     def update(self, t, data):
         if self.data_prev is None:
             ddiff = np.zeros_like(data)
+            self.t_prev=copy.deepcopy(t)
         elif self.data_pprev is None:
             ddiff = np.zeros_like(data)
+            self.t_pprev=copy.deepcopy(t)
         else:
-            ddiff = (data - 2 * self.data_prev - self.data_pprev) / np.average(np.diff([t, self.t_prev, self.t_pprev]))**2
+            ddiff = (data - 2 * self.data_prev + self.data_pprev) / np.average(
+                np.diff([t, self.t_prev, self.t_pprev])
+            ) ** 2
         self.data_pprev = copy.deepcopy(self.data_prev)
         self.data_prev = copy.deepcopy(data)
         self.t_pprev = copy.deepcopy(self.t_prev)
         self.t_prev = copy.deepcopy(t)
         return ddiff
 
+
 if __name__ == "__main__":
     rclpy.init()
     node = Node("t")
     this_conn, that_conn = Pipe()
-    ctrl = Control(that_conn, this_conn)
+    ctrl = Control([that_conn, this_conn] * 3, node)
     ctrl.run()
