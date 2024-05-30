@@ -128,14 +128,47 @@ class Control:
                 0.0125 / 2,
                 0.0125 / 4,
                 0.0125 / 2,
-                0.0125 * 2,
+                0.0125 * 4,
                 0.0125 / 2,
                 0.0125 / 2,
                 0.0125,
             ]
             * 2
         )
-        self.kd = np.array([1 / 2, 1 / 2, 2, 1, 2, 1, 1, 1 * 2] * 2)
+        self.kd = np.array([2, 1 / 2, 2, 1, 2,
+                            0.5, 1, 1 * 2] * 2)
+
+        self.kp_l = np.array(
+            [
+                0.5,
+                0.5,
+                0.25,
+                0.5,
+                0.1,
+                0.25,
+                0.55,
+                0.18,
+            ]
+            * 2
+        )
+        self.ki_l = np.array(
+            [
+                0.0125,
+                0.0125 / 2,
+                0.0125 / 4,
+                0.0125 / 2,
+                0.0125 * 4,
+                0.0125 / 2,
+                0.0125,
+                0.0125,
+            ]
+            * 2
+        )
+        self.kd_l = np.array([1, 2, 2, 1,5, 0.5, 1
+                              , 1 ] * 2)
+        
+        
+
         self.integrator = Integrator()
         self.integrator_der = Integrator()
         self.st_w = Integrator()
@@ -315,6 +348,7 @@ class Control:
     def joint_saturator(v):
         pump_4lpm_sat_v = 5.4
         pump_8lpm_sat_v = 3.52
+        #pump_8lpm_sat_v = 2.8
 
         v_p_max = np.where(
             [True, False, False, True, False, False, False, False] * 2,
@@ -403,14 +437,14 @@ class Control:
         e = np.array([[e1], [e2]])
 
         M, C, G = self.CalDynamics(q, q_dot, m, l)
-        D = np.array([[0.015], [0.07]])
+        D = np.array([[0.04], [0.07]])
 
         g_x = np.linalg.inv(M)
         f_x = g_x @ (-C * np.array([[q1_dot], [q2_dot]]) - G)
 
         c = np.array([[0.2], [0.9]])
         e_dot = self.e_diff.update(t, e)
-        print("e_dot:",e_dot)
+        # print("e_dot:",e_dot)
         
         # des_q_ddot = self.q_ddiff.update(t, np.array([[des_q1], [des_q2]]))
         des_q_ddot = np.clip(self.q_ddiff.update(t, np.array([[des_q1], [des_q2]])),np.deg2rad(-5),np.deg2rad(5))
@@ -419,9 +453,9 @@ class Control:
 
         # u = M @ (c * e_dot + des_q_ddot - f_x + D * np.sign(s))
         #s[0] = self.saturation_s(s[0])
-        s[0] = self.super_twisting(t,s[0])
-        #s[1] = self.saturation_s(s[1])
-        u = M @ (c * e_dot + des_q_ddot - f_x + s)
+        #s[0] = self.super_twisting(t,s[0])
+        s[0] = self.saturation_s(s[0])
+        u = M @ (c * e_dot + des_q_ddot - f_x + D*s)
         # print("D*s",D*s)
         # u = M @ (c * e_dot + des_q_ddot - f_x + D * s)
 
@@ -446,7 +480,7 @@ class Control:
             * np.sin(q1_dl_0 - q1)
             / (
                 np.sqrt(
-                    l1_base**2 - 2 * l1_base * l1_rot * np.cos(q1_dl_0 - q1) + l1_rot**2
+                    l1_base**2 - 2 * l1_base * l1_rot * np.cos(q1_dl_0 + q1) + l1_rot**2
                 )
             )
         )
@@ -456,7 +490,7 @@ class Control:
             * np.sin(q2_dl_0 - q2)
             / (
                 np.sqrt(
-                    l2_base**2 - 2 * l2_base * l2_rot * np.cos(q2_dl_0 - q2) + l2_rot**2
+                    l2_base**2 - 2 * l2_base * l2_rot * np.cos(q2_dl_0 + q2) + l2_rot**2
                 )
             )
         )
@@ -481,15 +515,6 @@ class Control:
         lpm8_vol = np.polynomial.Polynomial([0, 0.7361, -0.0408, 0.001])
         v1 = lpm8_vol(abs(Q1)) * np.sign(Q1)
         v2 = lpm4_vol(abs(Q2)) * np.sign(Q2)
-
-        print("Start-----------------------------------------------")
-        print("s[0]:",s[0])
-        print("des_q2:" ,-np.rad2deg(des_q1))
-        print("des_q_ddot:" ,np.rad2deg(des_q_ddot[0]))
-        print("con_q_ddot[1]: ",con_q_ddot[0])
-        print("con_q_dot[1]: ",con_q_dot[0])
-        print("v1: ",v1)
-
 
         return v1, v2
 
@@ -519,6 +544,74 @@ class Control:
         G2 = m2 * g * l2 * np.cos(q1 + q2)
         G = np.array([[G1[0]], [G2[0]]])
         return M, C, G
+    
+    def qtoc(self,q):
+        c = np.zeros(16)
+        l_base = np.array([0.275, 0.157, 0.065, 0.334,0, 0.183, 0.109, 0.027]*2) #m
+        l_rot = np.array([0.068, 0.111, 0.258, 0.080,0, 0.025,0.043, 0.155]*2) #m
+        q_0 =np.array([36.51, 101.17, 33.31, 76.17,0, 79.0,29.25, 96.0]*2) #deg
+        for i in range(16):
+            ## 5 Axis
+            if i == 4 or i == 12:
+                c[i] = q[i]
+            ## 7 Axis
+            elif i == 6 or i == 14:
+                c[i] = 2*l_rot[i]*(np.sin(np.deg2rad(q[i]+q_0[i])))+l_base[i]
+            else:
+            ## 1,2,3,4,6,8 Axis
+                c[i] = np.sqrt(l_base[i]**2+l_rot[i]**2-2*l_base[i]*l_rot[i]*np.cos(np.deg2rad(q[i]+q_0[i])))
+        return c ## m
+    
+    def cal_gainScaleFactor(self):
+        k = np.zeros(16)
+        c_5 = np.zeros(16)
+        c_minus5 = np.zeros(16)
+        l_base = np.array([0.275, 0.157, 0.065, 0.334,0, 0.183, 0.109, 0.027]*2) #m
+        l_rot = np.array([0.068, 0.111, 0.258, 0.080,0, 0.025,0.043, 0.155]*2) #m
+        q_0 =np.array([36.51, 101.17, 33.31, 76.17,0, 79.0,29.25, 96.0]*2) #deg
+        for i in range(16):
+            ## 5 Axis
+            if i == 4 or i == 12:
+                k[i] = 1
+            ## 7 Axis
+            elif i == 6 or i == 14:
+                c_5[i] = 2*l_rot[i]*(np.sin(np.deg2rad(10+q_0[i])))+l_base[i]
+                c_minus5[i] = 2*l_rot[i]*(np.sin(np.deg2rad(0+q_0[i])))+l_base[i]
+                k[i] = 10/(c_5[i]-c_minus5[i])
+            else:
+            ## 1,2,3,4,6,8 Axis
+                c_5[i] = np.sqrt(l_base[i]**2+l_rot[i]**2-2*l_base[i]*l_rot[i]*np.cos(np.deg2rad(5+q_0[i])))
+                c_minus5[i] = np.sqrt(l_base[i]**2+l_rot[i]**2-2*l_base[i]*l_rot[i]*np.cos(np.deg2rad(-5+q_0[i])))
+                k[i] = 10/(c_5[i]-c_minus5[i])
+        return k
+    
+    def cal_refVelocityVolt(joint_pos,ref_q_dot):
+        ## 5축은 쓰레기값
+        l_base = np.array([0.275, 0.157, 0.065, 0.334,1, 0.183, 0.109, 0.027]*2) #m
+        l_rot = np.array([0.068, 0.111, 0.258, 0.080,1, 0.025,0.043, 0.155]*2) #m
+        q_0 =np.array([36.51, 101.17, 33.31, 76.17,1, 79.0,29.25, 96.0]*2) #deg
+        A_push = np.array([1257, 707, 707, 1257, 0, 962, 962, 962]*2)*1e-6 #m^2
+        A_pull = np.array([942.5, 530.1, 530.1, 942.5, 0, 785.4, 785.4, 785.4]*2)*1e-6 #m^2
+        lpm4_vol = np.polynomial.Polynomial([0, 0.7206])
+        lpm8_vol = np.polynomial.Polynomial([0, 0.7361, -0.0408, 0.001])
+        dc_dq = np.zeros(16)
+        ref_v = np.zeros(16)
+        
+        dc_dq = (l_base* l_rot* np.sin(np.deg2rad(q_0 + joint_pos))/(np.sqrt(l_base**2 - 2 * l_base * l_rot * np.cos(np.deg2rad(q_0 + joint_pos)) + l_rot**2)))
+        ref_c_dot = ref_q_dot*dc_dq
+        ref_Q = ref_c_dot*A_push*(ref_c_dot>=0)*60000+ref_c_dot*A_pull*(ref_c_dot<0)*60000
+
+        for i in range(16):
+            if i == 0 or i == 3 or i == 8 or i == 11:
+                ref_v[i] = lpm8_vol(abs(ref_Q[i])) * np.sign(ref_Q[i])
+            elif i ==4 or i == 12:
+                ref_v[i] = 5
+            else:
+                ref_v[i] = lpm4_vol(abs(ref_Q[i])) * np.sign(ref_Q[i])
+        return ref_v
+
+        
+        
 
     def run(self):
         frame = 0
@@ -535,25 +628,37 @@ class Control:
                     self.receiver()
                 t = time.monotonic_ns()
 
-                u = self.smc_1_dof(t, self.joint_pos, self.joint_vel, self.ref_pos)
+                #u = self.smc_1_dof(t, self.joint_pos, self.joint_vel, self.ref_pos)
                 # self.node.get_logger().debug(
                 #     f"{u}",
                 # )
-
                 err = self.err_calc()
+                err_l = self.qtoc(self.ref_pos) - self.qtoc(self.joint_pos)
+                err = err_l
                 err[4] *= -1
                 err[12] *= -1
+                #####6축 e_v 추가
                 err_i = self.err_i_calc(t, err)
                 err_d = self.err_d_calc(t, err)
                 vd = (
-                    err * self.kp + err_i * self.ki + err_d * self.kd
-                )  #+ self.sliding_mode_controller(err, err_d)
-                vd[11] = u[0]
-                #vd[13] = u[1]
-                # print("vd[11]:",vd[11])
-                # print("vd[13]:",vd[13])
+                    err * self.kp_l + err_i * self.ki_l + err_d * self.kd_l
+                )
+                k = self.cal_gainScaleFactor()
+                vd = vd*k
+                for i in range(16):
+                    pullGainFactor = np.array([0.75, 0.75, 0.75, 0.75,1,0.816,0.816,0.816]*2)
+                    if vd[i]<=0:
+                        vd[i] = vd[i]*pullGainFactor[i]
                 vd_sat = self.joint_saturator(vd)
+                #### 추가 부분 #####
+                ref_q_dot = 0
+                #velocityVolt_ref = vd
+                velocityVolt_ref = self.cal_refVelocityVolt(self.joint_pos[11],ref_q_dot)
+                ##################################################################
+
                 self.is_clamp = (vd_sat != vd) & (np.sign(vd) == np.sign(err))
+                if np.abs(err[12]) < 0.5:
+                    self.is_clamp[12]=True
                 Q_j_est = self.joint_flow_estimator(vd_sat)
                 Q_p_est = self.mhpu_flow_estimator(self.des_rpm)
                 # v_fc = self.flow_distributer(vd_sat, Q_j_est, Q_p_est*1.2)
@@ -765,7 +870,6 @@ class FiniteDiff:
             diff = np.zeros_like(data)
         else:
             diff = (data - self.data_prev) / (t - self.t_prev)
-        print("t - self.t_prev",t - self.t_prev)
         self.t_prev = copy.deepcopy(t)
         self.data_prev = copy.deepcopy(data)
         return diff

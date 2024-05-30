@@ -487,10 +487,12 @@ class Robot(Node):
                         0,
                     )
                 )
-
+                # ms_joint_pos[13] = 50*np.sin(2*np.pi*t_ros.nanoseconds/1e9/6)
                 ms_state["joint_pos"] = ms_joint_pos
                 self.ref_pos = ms_state["joint_pos"]
+
                 self.is_on_hold_prev = is_on_hold
+
 
                 smooth_factor = np.clip(
                     (t_ros.nanoseconds // 1e9 - self.joint_when_on) / 2, 0, 1
