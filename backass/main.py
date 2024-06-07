@@ -15,9 +15,11 @@ from Phidget22.Phidget import Phidget
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_system_default, qos_profile_sensor_data
+from rclpy.qos import qos_profile_default, qos_profile_sensor_data
 from std_msgs.msg import Header
 from sensor_msgs.msg import JointState
+from trajectory_msgs.msg import JointTrajectoryPoint
+from moveit_msgs.msg import MotionPlanResponse
 from ass_msgs.msg import (
     Robot2UI,
     Hold,
@@ -25,6 +27,8 @@ from ass_msgs.msg import (
     UIAction,
     PoseIteration,
     ArmMasterCommInt,
+    TrajectoryPoint,
+    TrajectoryExecution
 )
 import control, pump, state, dxl_control
 from utils import *
@@ -127,6 +131,7 @@ class Robot(Node):
             "err_d": np.zeros(16, dtype=float),
             "err_norm": 0.0,
             "frame": 0,
+            "v_tr_max":np.zeros(16, dtype=float),
         }
         self.ms_state["joint_pos"][3] = 20
         self.ms_state["joint_pos"][10] = 20
@@ -146,7 +151,7 @@ class Robot(Node):
         self.flag_is_hold = np.array([False] * 16)
 
         self.pub = self.create_publisher(
-            Robot2UI, "robot_to_ui", qos_profile_system_default
+            Robot2UI, "robot_to_ui", qos_profile_default
         )
         self.create_subscription(
             ArmMasterCommInt,
@@ -156,13 +161,13 @@ class Robot(Node):
         )
 
         self.moveit_pub = self.create_publisher(
-            JointState, "joint_states", qos_profile_system_default
+            JointState, "joint_states", qos_profile_default
         )
         self.hold_sub = self.create_subscription(
             Hold,
             "hold",
             callback=self.cb_hold_sub,
-            qos_profile=qos_profile_system_default,
+            qos_profile=qos_profile_default,
         )
 
         self.is_on_hold = np.array([False] * 16)
@@ -175,7 +180,7 @@ class Robot(Node):
             Preset,
             "preset",
             callback=self.cb_preset_sub,
-            qos_profile=qos_profile_system_default,
+            qos_profile=qos_profile_default,
         )
         self.preset_pos = np.zeros(16)
         self.is_preset_mode = False
@@ -186,7 +191,7 @@ class Robot(Node):
             UIAction,
             "ui_action",
             callback=self.cb_ui_action_sub,
-            qos_profile=qos_profile_system_default,
+            qos_profile=qos_profile_default,
         )
         self.ui_state = UIAction(
             pump_pwr=False,  # pump_pwr
@@ -199,17 +204,47 @@ class Robot(Node):
             pump_max_err=50,  # pump_max_err
             ctrl_mode=0,  # ctrl_mode
         )
-
         self.pose_iter_sub = self.create_subscription(
             PoseIteration,
             "pose_iter",
             callback=self.cb_pose_override,
-            qos_profile=qos_profile_system_default,
+            qos_profile=qos_profile_default,
         )
+        self.traj_point_sub = self.create_subscription(
+            TrajectoryPoint,
+            "traj_point",
+            callback=self.cb_traj_point,
+            qos_profile=qos_profile_default,
+        )
+        self.trajetory_execution_sub = self.create_subscription(
+            TrajectoryExecution,
+            "traj_exec",
+            callback=self.cb_traj_exec,
+            qos_profile=qos_profile_default
+        )
+        self.planned_trajectory_sub = self.create_subscription(
+            MotionPlanResponse,
+            "planned_trajectory",
+            callback=self.cb_planned_trajectory,
+            qos_profile=qos_profile_default
+        )
+        
         self.pose_override_enabled = False
         self.pose_override_dxl = 0
+        
+        self.traj_enabled = False
+        self.traj_dxl_cmd = 0 
+        self.traj_point = JointTrajectoryPoint()
+        
+        self.t_traj_exec_started = None
+        self.trajectory = []
+        self.trajectory_idx = 0
 
         self.enable_logging = True
+        self.freq = np.zeros(3, dtype=float)
+        
+        self.publisher_timer = self.create_timer(0.01, self.cb_publisher)
+        self.publisher_timer.reset()
 
         self.th_spin = Thread(target=rclpy.spin, kwargs={"node": self}, daemon=True)
         self.th_spin.start()
@@ -236,6 +271,9 @@ class Robot(Node):
                 + [f"L{i} cmd" for i in range(1, 9)]
                 + [f"R{i} cmd" for i in range(1, 9)]
                 + ["FB rpm", "des rpm", "des cur", "elmo_temp"]
+                + [f"L{i} v_t_max" for i in range(1, 9)]
+                + [f"R{i} v_t_max" for i in range(1, 9)]
+                ## 행추가
             )
             if self.phidget_temp is not None:
                 header.append("phidget_temp")
@@ -262,12 +300,87 @@ class Robot(Node):
                 self.pump_state["des_rpm"],
                 self.pump_state["des_cur"],
                 self.pump_state["elmo_temp"],
+                ## 데이터 추가
             ],
+        )
+        logdata.extend(
+            self.ctrl_state["v_tr_max"],
         )
         if self.phidget_temp is not None:
             temp = self.phidget_temp.getTemperature()
             logdata.append(temp)
         self.log_file.write(",".join(map("{:.4f}".format, logdata)) + "\n")
+        
+    def cb_publisher(self):
+        t = self.get_clock().now()
+        self.pub.publish(
+            Robot2UI(
+                header=Header(stamp=t.to_msg()),
+                pump_act_rpm=self.pump_state["act_rpm"],
+                pump_des_rpm=self.pump_state["des_rpm"],
+                pump_des_cur=self.pump_state["des_cur"],
+                pump_temp=self.pump_state["elmo_temp"],
+                arm_state=self.sl_state["joint_pos"],
+                ref_state=self.ms_state["joint_pos"],
+                track_left_state=int(self.ms_state["track_cmd"][0]),
+                track_right_state=int(self.ms_state["track_cmd"][1]),
+                cmd_voltage=self.ctrl_state["cmd"],
+                err=self.ctrl_state["err"],
+                err_i=self.ctrl_state["err_i"],
+                err_d=self.ctrl_state["err_d"],
+                err_norm=self.ctrl_state["err_norm"],
+                freq=self.freq,
+            )
+        )
+        joint_state = JointState()
+        joint_state.name = [
+            "joint1_left",
+            "joint2_left",
+            "joint3_left",
+            "joint4_left",
+            "joint5_left",
+            "joint6_left",
+            "joint7r_1_left",
+            "joint7r_left",
+            "joint7r_2_left",
+            "joint7l_1_left",
+            "joint7l_left",
+            "joint7l_2_left",
+            "joint8_left",
+            "joint1_right",
+            "joint2_right",
+            "joint3_right",
+            "joint4_right",
+            "joint5_right",
+            "joint6_right",
+            "joint7r_1_right",
+            "joint7r_right",
+            "joint7r_2_right",
+            "joint7l_1_right",
+            "joint7l_right",
+            "joint7l_2_right",
+            "joint8_right",
+        ]
+        joint_pos = np.deg2rad(self.sl_state["joint_pos"])
+        joint_pos = np.insert(joint_pos, 6, [joint_pos[6]] * 5)
+        joint_pos = np.insert(joint_pos, -2, [joint_pos[-2]] * 5)
+        joint_vel = np.deg2rad(self.sl_state["joint_vel"])
+        joint_vel = np.insert(joint_vel, 6, [joint_vel[6]] * 5)
+        joint_vel = np.insert(joint_vel, -2, [joint_vel[-2]] * 5)
+        joint_pos = joint_pos * ([1, 1, 1, 1, 1, 1, 1, -1, 1, -1, 1, -1, 1] * 2)
+        joint_state.position = joint_pos.tolist()
+        joint_state.velocity = joint_vel.tolist()
+        self.moveit_pub.publish(joint_state)
+    
+    def cb_traj_exec(self, data):
+        self.get_logger().info("starting execution....")
+        self.t_traj_exec_started = time.time_ns()
+            
+    def cb_planned_trajectory(self, data: MotionPlanResponse):
+        self.t_traj_exec_started = None
+        self.trajectory = data.trajectory.joint_trajectory.points
+        self.trajectory_idx = 0
+        self.get_logger().info("planned trajectory received")
 
     def start_proc(self):
         # self.ms_proc_handle.start()
@@ -301,6 +414,7 @@ class Robot(Node):
         self.is_preset_mode = data.enabled
         self.preset_pos = np.array(data.preset_pos)
         self.get_logger().info(f"{self.is_preset_mode, self.preset_pos}")
+    
 
     def cb_ms_state(self, data: ArmMasterCommInt):
         ms_joint_state = np.array(
@@ -375,67 +489,14 @@ class Robot(Node):
         self.pose_override_pose = data.poses[:16]
         # FIXME
         self.pose_override_dxl = data.trigger
-
+    
+    def cb_traj_point(self, data: TrajectoryPoint):
+        self.traj_enabled = data.enabled
+        self.traj_point = data.point
+        self.traj_dxl_cmd = data.trigger
+        
     def sigint_handler(self, signum, frame):
         raise KeyboardInterrupt
-
-    def homing(self, tgt_joint: Union[list, int]) -> None:
-        """
-        function for homing joints. while on action,
-        blocks code until homing finished
-        """
-        joint_list = [f"L{i}" for i in range(1, 9)] + [f"R{i}" for i in range(1, 9)]
-        pump_rpm = 300
-        volt_cmd = 3
-
-        if type(tgt_joint) is int:
-            tgt_joint = [tgt_joint]
-
-        for i in tgt_joint:
-            print(f"Start Homing for Joint {joint_list[i]}...")
-            pump_cmd: PumpCommand = {
-                "power": True,
-                "mode": 0,
-                "tgt_rpm": pump_rpm,
-                "min_rpm": 0,
-                "max_rpm": 0,
-                "max_err": 0,
-                "err_norm": 0,
-            }
-            self.pump_fast_pipe.send(pump_cmd)
-            sl_state_prev = self.sl_fast_pipe.recv()
-
-            cmd_override = np.zeros(16)
-            cmd_override[i] = volt_cmd  # needs to be specified
-            joint_pwr = np.zeros(16)
-            joint_pwr[i] = 1
-
-            ext_cmd = chr(ord(self.sl_handle.cui_addr[i].decode()) + 2).encode()
-            set_zero_cmd = b"\x5e"
-
-            ctrl_cmd: CtrlCommand = {
-                "joint_power": joint_pwr,
-                "joint_pos": sl_state_prev["joint_pos"],
-                "ref_pos": sl_state_prev["joint_pos"],
-                "cmd_override": cmd_override,
-                "smooth_factor": np.ones(16),
-            }
-            self.ctrl_fast_pipe.send(ctrl_cmd)
-            while True:
-                sl_state = self.sl_fast_pipe.recv()
-                diff = sl_state["joint_pos"][i] - sl_state_prev["joint_pos"][i]
-                if self.is_homed(i):
-                    break
-            self.sl_pause_pipe.send("PAUSE")
-            self.sl_handle.ser.write(ext_cmd)
-
-            self.sl_handle.ser.write(set_zero_cmd)
-            self.sl_pause_pipe.send("RESUME")
-
-            # offset
-
-        def is_homed(joint_idx: int) -> bool:
-            pass
 
     def run(self):
         self.start_proc()
@@ -467,13 +528,40 @@ class Robot(Node):
                     is_on_hold = np.where(
                         np.isnan(self.pose_override_pose), True, is_on_hold
                     )
-                    ms_state["lift_cmd"][1] = 1
-                    ms_state["track_cmd"][1] = (
-                        self.pose_override_dxl * 5 + 500
-                        if self.pose_override_dxl != -1
-                        else -1
-                    )
-
+                    ms_state["lift_cmd"][1] = 1 if self.pose_override_dxl != -1 else 0
+                    ms_state["track_cmd"][1] = self.pose_override_dxl * 5 + 500 if self.pose_override_dxl != -1 else -1
+                if self.traj_enabled:  # for legacy (execution on ui)
+                    traj_pos = [np.nan] * 8
+                    traj_pos.extend(np.rad2deg(self.traj_point.positions))
+                    traj_pos.extend([np.nan] * 2)
+                    is_on_hold = np.where(
+                        np.isnan(traj_pos), True, is_on_hold
+                    )                    
+                    ms_state["joint_pos"] = np.array(traj_pos)
+                    
+                if self.t_traj_exec_started is not None:
+                    nsec = (self.trajectory[self.trajectory_idx].time_from_start.sec * 1e9
+                            + self.trajectory[self.trajectory_idx].time_from_start.nanosec)
+                    time_passed = time.time_ns() - self.t_traj_exec_started
+                    if time_passed > nsec:
+                        self.trajectory_idx += 1
+                    if self.trajectory_idx >= len(self.trajectory):
+                        self.t_traj_exec_started = None
+                        continue
+                    elif self.trajectory_idx == len(self.trajectory) - 1:
+                        interpolated = np.rad2deg(self.trajectory[self.trajectory_idx].positions)
+                    else:    
+                        position = np.rad2deg(self.trajectory[self.trajectory_idx].positions)
+                        position_next = np.rad2deg(self.trajectory[self.trajectory_idx + 1].positions)
+                        nsec_next = (self.trajectory[self.trajectory_idx + 1].time_from_start.sec * 1e9
+                                    + self.trajectory[self.trajectory_idx + 1].time_from_start.nanosec)
+                        interpolated = position + (time_passed - nsec) * (position_next - position) / (nsec_next - nsec)
+                    position = [np.nan] * 8
+                    position.extend(interpolated)
+                    position.extend([np.nan] * 2)
+                    is_on_hold = np.where(np.isnan(position), True, is_on_hold)
+                    ms_state["joint_pos"] = np.array(position)
+                
                 ms_joint_pos = (
                     np.where(~is_on_hold, ms_state["joint_pos"], 0)
                     + np.where(
@@ -487,17 +575,17 @@ class Robot(Node):
                         0,
                     )
                 )
+                # print(ms_joint_pos)
                 # ms_joint_pos[13] = 50*np.sin(2*np.pi*t_ros.nanoseconds/1e9/6)
                 ms_state["joint_pos"] = ms_joint_pos
                 self.ref_pos = ms_state["joint_pos"]
 
                 self.is_on_hold_prev = is_on_hold
 
-
                 smooth_factor = np.clip(
                     (t_ros.nanoseconds // 1e9 - self.joint_when_on) / 2, 0, 1
                 )
-                ctrl_cmd: CtrlCommand = {
+                ctrl_cmd = {
                     "joint_pos": self.sl_state["joint_pos"],
                     "joint_vel": self.sl_state["joint_vel"],
                     "joint_acc": self.sl_state["joint_acc"],
@@ -508,7 +596,9 @@ class Robot(Node):
                     "max_rpm": ui_state.pump_max_rpm,
                     "des_rpm": self.pump_state["des_rpm"],
                 }
-                pump_cmd: PumpCommand = {
+                if self.traj_enabled:
+                    ctrl_cmd["traj_point"] = self.traj_point
+                pump_cmd = {
                     "power": ui_state.pump_pwr,
                     "mode": ui_state.pump_mode,
                     "tgt_rpm": ui_state.pump_tgt_speed,
@@ -520,18 +610,18 @@ class Robot(Node):
                 dxl_pos_cmd = np.array(
                     [
                         ms_state["track_cmd"][0],
-                        (
-                            ms_state["track_cmd"][1]
-                            if ms_state["lift_cmd"][1] == 0
-                            else 500
-                        ),
+                        ms_state["track_cmd"][1] if ms_state["lift_cmd"][1] == 0 else 500,
                         ms_state["lift_cmd"][0],
-                        (
-                            ms_state["track_cmd"][1]
-                            if not ms_state["lift_cmd"][1] == 0
-                            else -1
-                        ),
-                    ]
+                        ms_state["track_cmd"][1] if not ms_state["lift_cmd"][1] == 0 else -1,
+                        ]
+                )
+                dxl_pos_cmd = np.array(
+                    [
+                        ms_state["track_cmd"][0],
+                        ms_state["track_cmd"][1],
+                        ms_state["lift_cmd"][0],
+                        ms_state["lift_cmd"][1],
+                        ]
                 )
                 dxl_cmd: DXLCommand = {"pos_cmd": dxl_pos_cmd}
 
@@ -543,80 +633,17 @@ class Robot(Node):
                     self.dxl_fast_pipe.send(dxl_cmd)
 
                 time_frame = np.vstack(
-                    (
-                        time_frame,
-                        [
-                            t_ros.nanoseconds,
-                            self.sl_state["frame"],
-                            self.ctrl_state["frame"],
-                            self.pump_state["frame"],
-                        ],
-                    )
-                )[-5000:]
-                freq = (
+                    (time_frame,
+                     [t_ros.nanoseconds,
+                      self.sl_state["frame"],
+                      self.ctrl_state["frame"],
+                      self.pump_state["frame"]]))[-5000:]
+                self.freq = (
                     (time_frame[-1][1:] - time_frame[0][1:])
                     / (time_frame[-1][0] - time_frame[0][0])
                     * 1e9
                 )
-
-                self.pub.publish(
-                    Robot2UI(
-                        header=Header(stamp=t_ros.to_msg()),
-                        pump_act_rpm=self.pump_state["act_rpm"],
-                        pump_des_rpm=self.pump_state["des_rpm"],
-                        pump_des_cur=self.pump_state["des_cur"],
-                        pump_temp=self.pump_state["elmo_temp"],
-                        arm_state=self.sl_state["joint_pos"],
-                        ref_state=ms_state["joint_pos"],
-                        track_left_state=int(ms_state["track_cmd"][0]),
-                        track_right_state=int(ms_state["track_cmd"][1]),
-                        cmd_voltage=self.ctrl_state["cmd"],
-                        err=self.ctrl_state["err"],
-                        err_i=self.ctrl_state["err_i"],
-                        err_d=self.ctrl_state["err_d"],
-                        err_norm=self.ctrl_state["err_norm"],
-                        freq=freq,
-                    )
-                )
-                joint_state = JointState()
-                joint_state.name = [
-                    "joint1_left",
-                    "joint2_left",
-                    "joint3_left",
-                    "joint4_left",
-                    "joint5_left",
-                    "joint6_left",
-                    "joint7r_1_left",
-                    "joint7r_left",
-                    "joint7r_2_left",
-                    "joint7l_1_left",
-                    "joint7l_left",
-                    "joint7l_2_left",
-                    "joint8_left",
-                    "joint1_right",
-                    "joint2_right",
-                    "joint3_right",
-                    "joint4_right",
-                    "joint5_right",
-                    "joint6_right",
-                    "joint7r_1_right",
-                    "joint7r_right",
-                    "joint7r_2_right",
-                    "joint7l_1_right",
-                    "joint7l_right",
-                    "joint7l_2_right",
-                    "joint8_right",
-                ]
-                joint_pos = np.deg2rad(self.sl_state["joint_pos"])
-                joint_pos = np.insert(joint_pos, 6, [joint_pos[6]] * 5)
-                joint_pos = np.insert(joint_pos, -2, [joint_pos[-2]] * 5)
-                joint_vel = np.deg2rad(self.sl_state["joint_vel"])
-                joint_vel = np.insert(joint_vel, 6, [joint_vel[6]] * 5)
-                joint_vel = np.insert(joint_vel, -2, [joint_vel[-2]] * 5)
-                joint_pos = joint_pos * ([1, 1, 1, 1, 1, 1, 1, -1, 1, -1, 1, -1, 1] * 2)
-                joint_state.position = joint_pos.tolist()
-                joint_state.velocity = joint_vel.tolist()
-                self.moveit_pub.publish(joint_state)
+                self.ms_state = ms_state
 
                 sl_proc_exitcode = self.sl_proc_handle.exitcode
                 ctrl_proc_exitcode = self.ctrl_proc_handle.exitcode

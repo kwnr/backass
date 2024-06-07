@@ -17,6 +17,7 @@ from rclpy.node import Node
 import rclpy.time
 import rclpy.timer
 
+from trajectory_msgs.msg import JointTrajectoryPoint
 
 class Control:
     def __init__(self, pipeset, parent_node: Node):
@@ -62,6 +63,7 @@ class Control:
         self.des_rpm = 0
 
         self.err_norm = 0.0
+        self.traj_point = JointTrajectoryPoint()
 
         self.phidget_retry_counter = 1
 
@@ -81,8 +83,8 @@ class Control:
                 -1000,
                 -1000,
                 -1000,
-                -1000,
-                -1000,
+                34.1,
+                -56.,
             ]
         )
         self.joint_max = np.array(
@@ -101,8 +103,8 @@ class Control:
                 1000,
                 1000,
                 1000,
-                1000,
-                1000,
+                34.2,
+                -46.,
             ]
         )
 
@@ -183,10 +185,14 @@ class Control:
         self.q1_diff = FiniteDiff()
         self.q2_diff = FiniteDiff()
         self.e_diff = FiniteDiff()
+        self.v_diff = FiniteDiff()
         self.q_ddiff = FiniteDDiff()
         self.con_q_integrator = Integrator()
         self.c1_prev = 0.0
         self.c2_prev = 0.0
+
+        self.v = 0.0
+
         self.node.get_logger().info("Control Process Initialized")
 
     def __del__(self):
@@ -228,7 +234,7 @@ class Control:
         Phidget.Phidget.finalize(0)
 
     def receiver(self):
-        items = self.conn.recv()
+        items: dict = self.conn.recv()
         self.joint_power = np.array(items["joint_power"])
         self.joint_pos = np.array(items["joint_pos"])
         self.joint_vel = np.array(items["joint_vel"])
@@ -238,6 +244,8 @@ class Control:
         self.cmd_override = np.array(items["cmd_override"], dtype=float)
         self.max_rpm = np.array(items["max_rpm"])
         self.des_rpm = np.array(items["des_rpm"])
+        if 'traj_point' in items.keys():
+            self.traj_point: JointTrajectoryPoint = items["traj_point"]
 
     def send_result(self, value):
         self.conn.send(value)
@@ -346,18 +354,18 @@ class Control:
 
     @staticmethod
     def joint_saturator(v):
-        pump_4lpm_sat_v = 5.4
-        pump_8lpm_sat_v = 3.52
-        #pump_8lpm_sat_v = 2.8
+        pump_4lpm_sat_v = 5.5
+        pump_8lpm_sat_v = 3.5
 
         v_p_max = np.where(
             [True, False, False, True, False, False, False, False] * 2,
             pump_8lpm_sat_v,
             pump_4lpm_sat_v,
-        )
+        ) # saturated by pump
         v_h_max = (
-            np.array([3.27, 4.06, 4.06, 3.27, 1.5, 1.5, 1.5, 1.5] * 2) * 1.4
+            np.array([3.27, 4.0, 4.06, 3.27, 1.7, 1.7, 1.7, 1.7] * 2)
         )  # saturated by hose
+
         v = np.clip(v, -v_p_max, v_p_max)
         v = np.clip(v, -v_h_max, v_h_max)
         return v
@@ -585,7 +593,32 @@ class Control:
                 k[i] = 10/(c_5[i]-c_minus5[i])
         return k
     
-    def cal_refVelocityVolt(joint_pos,ref_q_dot):
+    def cal_v_tr_max(self,joint_pos,v_tr):
+        ## 5축은 쓰레기값
+        l_base = np.array([0.275, 0.157, 0.065, 0.334,1, 0.183, 0.109, 0.027]*2) #m
+        l_rot = np.array([0.068, 0.111, 0.258, 0.080,1, 0.025,0.043, 0.155]*2) #m
+        q_0 =np.array([36.51, 101.17, 33.31, 76.17,1, 79.0,29.25, 96.0]*2) #deg
+        A_push = np.array([1257, 707, 707, 1257, 0, 962, 962, 962]*2)*1e-6 #m^2
+        A_pull = np.array([942.5, 530.1, 530.1, 942.5, 0, 785.4, 785.4, 785.4]*2)*1e-6 #m^2
+        lpm4_vol = np.polynomial.Polynomial([0, 0.9])
+        lpm8_vol = np.polynomial.Polynomial([0, 0.7361, -0.0408, 0.001])
+        dc_dq = np.zeros(16)
+        ref_v = np.zeros(16)
+        
+        dc_dq = (l_base* l_rot* np.sin(np.deg2rad(q_0 + joint_pos))/(np.sqrt(l_base**2 - 2 * l_base * l_rot * np.cos(np.deg2rad(q_0 + joint_pos)) + l_rot**2)))
+        tr_c_dot = v_tr*dc_dq
+        tr_Q = tr_c_dot*A_push*(tr_c_dot>=0)*60000+tr_c_dot*A_pull*(tr_c_dot<0)*60000
+
+        for i in range(16):
+            if i == 0 or i == 3 or i == 8 or i == 11:
+                ref_v[i] = lpm8_vol(abs(tr_Q[i])) * np.sign(tr_Q[i])
+            elif i ==4 or i == 12:
+                ref_v[i] = 5
+            else:
+                ref_v[i] = lpm4_vol(abs(tr_Q[i])) * np.sign(tr_Q[i])
+        return ref_v
+    
+    def cal_v_dot_tr_max(self,joint_pos,a_tr):
         ## 5축은 쓰레기값
         l_base = np.array([0.275, 0.157, 0.065, 0.334,1, 0.183, 0.109, 0.027]*2) #m
         l_rot = np.array([0.068, 0.111, 0.258, 0.080,1, 0.025,0.043, 0.155]*2) #m
@@ -594,25 +627,54 @@ class Control:
         A_pull = np.array([942.5, 530.1, 530.1, 942.5, 0, 785.4, 785.4, 785.4]*2)*1e-6 #m^2
         lpm4_vol = np.polynomial.Polynomial([0, 0.7206])
         lpm8_vol = np.polynomial.Polynomial([0, 0.7361, -0.0408, 0.001])
-        dc_dq = np.zeros(16)
-        ref_v = np.zeros(16)
+        ddc_ddq = np.zeros(16)
+        tr_v_dot = np.zeros(16)
         
-        dc_dq = (l_base* l_rot* np.sin(np.deg2rad(q_0 + joint_pos))/(np.sqrt(l_base**2 - 2 * l_base * l_rot * np.cos(np.deg2rad(q_0 + joint_pos)) + l_rot**2)))
-        ref_c_dot = ref_q_dot*dc_dq
-        ref_Q = ref_c_dot*A_push*(ref_c_dot>=0)*60000+ref_c_dot*A_pull*(ref_c_dot<0)*60000
+        ddc_ddq = (l_base*l_rot*(l_base**2+l_rot**2)*np.cos(np.deg2rad(joint_pos+q_0))-l_base*l_rot*np.sin(np.deg2rad(joint_pos+q_0))**2-2*l_rot*l_base*np.cos(np.deg2rad(joint_pos+q_0))**2)/np.sign((l_base**2-2*l_base*l_rot+np.cos(np.deg2rad(joint_pos+q_0))+l_rot**2))*np.abs((l_base**2-2*l_base*l_rot+np.cos(np.deg2rad(joint_pos+q_0))+l_rot**2))**(3/2)
+        tr_c_ddot = a_tr*ddc_ddq
+        tr_Q_dot = tr_c_ddot*A_push*(tr_c_ddot>=0)*60000+tr_c_ddot*A_pull*(tr_c_ddot<0)*60000
 
         for i in range(16):
             if i == 0 or i == 3 or i == 8 or i == 11:
-                ref_v[i] = lpm8_vol(abs(ref_Q[i])) * np.sign(ref_Q[i])
+                tr_v_dot[i] = lpm8_vol(abs(tr_Q_dot[i])) * np.sign(tr_Q_dot[i])
             elif i ==4 or i == 12:
-                ref_v[i] = 5
+                tr_v_dot[i] = 5
             else:
-                ref_v[i] = lpm4_vol(abs(ref_Q[i])) * np.sign(ref_Q[i])
-        return ref_v
+                tr_v_dot[i] = lpm4_vol(abs(tr_Q_dot[i])) * np.sign(tr_Q_dot[i])
+        return tr_v_dot
+    
+    def tr_joint_saturator(self,v,v_t_max,v_dot_t_max,v_diff,t):
+        # if self.t_pre is None:
+        #     self.t_pre = copy.deepcopy(t)
+        #     self.v_pre = copy.deepcopy(v)
+        for i in range(16):
+        #     if np.abs(v_diff[i])>np.abs(v_dot_t_max[i]):
+        #         v[i] = self.v_pre[i] + v_dot_t_max[i]*(t-self.t_pre)
+            if v_t_max[i] != 0:
+                if v_t_max[i]>=0:
+                    v[i] = np.clip(v[i],-np.abs(v[i]),np.abs(v_t_max[i]))
+                else:
+                    v[i] = np.clip(v[i],-np.abs(v_t_max[i]),np.abs(v[i]))
+        # self.t_pre = copy.deepcopy(t)
+        # self.v_pre = copy.deepcopy(v)
+        return v
+    
+    def joint_acc_saturator(self,v,v_diff,t):
+        v_dot_max = [5, 5, 5, 5, 5, 5, 5, 5, 0.05, 0.05, 0.05, 0.05, 5, 0.05, 0.05, 0.05]
+        if self.t_pre is None:
+            self.t_pre = copy.deepcopy(t)
+            self.v_pre = copy.deepcopy(v)
+        for i in range(16):
+            if np.abs(v_diff[i])>np.abs(v_dot_max[i]):
+                v[i] = self.v_pre[i] + v_dot_max[i]*(t-self.t_pre)*np.sign(v_diff[i])
+                # print("Saurated",i)
+        self.t_pre = copy.deepcopy(t)
+        self.v_pre = copy.deepcopy(v)
+        return v
+        
 
         
-        
-
+            
     def run(self):
         frame = 0
         try:
@@ -623,21 +685,25 @@ class Control:
             self.integrator_der.initialize(t, np.zeros(16))
             clamp_sat_limit = 5.5
             actuator_sat_limit = 9.9
+            self.t_pre = None
+            self.v_pre = None
+            a_tr = np.zeros(16)
+            v_tr = np.zeros(16)
             while True:
                 if self.conn.poll():
                     self.receiver()
                 t = time.monotonic_ns()
+                """if len(self.traj_point.accelerations)!=0:
+                    for i in range(6):
+                        a_tr[i+8]=self.traj_point.accelerations[i]
+                        v_tr[i+8]=self.traj_point.velocities[i]"""
 
-                #u = self.smc_1_dof(t, self.joint_pos, self.joint_vel, self.ref_pos)
-                # self.node.get_logger().debug(
-                #     f"{u}",
-                # )
                 err = self.err_calc()
                 err_l = self.qtoc(self.ref_pos) - self.qtoc(self.joint_pos)
                 err = err_l
                 err[4] *= -1
                 err[12] *= -1
-                #####6축 e_v 추가
+
                 err_i = self.err_i_calc(t, err)
                 err_d = self.err_d_calc(t, err)
                 vd = (
@@ -647,20 +713,29 @@ class Control:
                 vd = vd*k
                 for i in range(16):
                     pullGainFactor = np.array([0.75, 0.75, 0.75, 0.75,1,0.816,0.816,0.816]*2)
-                    if vd[i]<=0:
+                    if vd[i]<0:
                         vd[i] = vd[i]*pullGainFactor[i]
+                
+                v_tr_max = np.zeros(16)
+                # v_tr_max = self.cal_v_tr_max(self.joint_pos,v_tr)
+                # v_tr_max = v_tr_max
+                # v_tr_max[9] = v_tr_max[9]*2
+                # v_tr_max[13] = v_tr_max[13]*2
+                # # # # print("v_t_max[11]",v_t_max[11])
+                # v_dot_tr_max = self.cal_v_dot_tr_max(self.joint_pos,a_tr)
+                # t = t/1e93
+                #v_diff = self.v_diff.update(t,vd)
+                # vd_sat = self.tr_joint_saturator(vd,v_tr_max,v_dot_tr_max,v_diff,t)
+                #vd = self.joint_acc_saturator(vd,v_diff,t)
                 vd_sat = self.joint_saturator(vd)
-                #### 추가 부분 #####
-                ref_q_dot = 0
-                #velocityVolt_ref = vd
-                velocityVolt_ref = self.cal_refVelocityVolt(self.joint_pos[11],ref_q_dot)
-                ##################################################################
+                
+
 
                 self.is_clamp = (vd_sat != vd) & (np.sign(vd) == np.sign(err))
                 if np.abs(err[12]) < 0.5:
                     self.is_clamp[12]=True
-                Q_j_est = self.joint_flow_estimator(vd_sat)
-                Q_p_est = self.mhpu_flow_estimator(self.des_rpm)
+                # Q_j_est = self.joint_flow_estimator(vd_sat)
+                # Q_p_est = self.mhpu_flow_estimator(self.des_rpm)
                 # v_fc = self.flow_distributer(vd_sat, Q_j_est, Q_p_est*1.2)
                 v_dc = self.dead_zone_compensate(vd_sat, 1.2, 0.01)
                 cmd = v_dc
@@ -671,6 +746,7 @@ class Control:
                 cmd = np.clip(
                     cmd, -actuator_sat_limit, actuator_sat_limit
                 )  # saturate command in range of phidget's range
+                cmd = np.where(self.joint_power.astype(bool), cmd, 0)
                 self.allocate_cmd(cmd)
                 frame += 1
                 if not self.conn_opp.poll():
@@ -682,6 +758,8 @@ class Control:
                             "err_i": err_i,
                             "err_d": err_d,
                             "err_norm": self.err_norm,
+                            "v_tr_max" : v_tr_max,
+                            ## 데이터 추가
                         }
                     )
 
