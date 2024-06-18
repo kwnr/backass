@@ -2,6 +2,7 @@ import numpy as np
 import time
 from typing import TypedDict, List
 
+
 class ExponentialMovingAverage():
     def __init__(self, w) -> None:
         """
@@ -10,9 +11,9 @@ class ExponentialMovingAverage():
         """
         self.prev = None
         self.weight = w
-    
+
     def update(self, val):
-        if self.prev == None:
+        if self.prev is None:
             self.prev = val
         ret = self.weight * val + (1 - self.weight) * self.prev
         self.prev = ret
@@ -21,16 +22,16 @@ class ExponentialMovingAverage():
 
 class LowPassFilter(object):
     def __init__(self, cut_off_freqency, ts):
-    	# cut_off_freqency: 차단 주파수
+        # cut_off_freqency: 차단 주파수
         # ts: 주기
         # https://velog.io/@7cmdehdrb/LowPassFilter
-        
+
         self.ts = ts
         self.cut_off_freqency = cut_off_freqency
         self.tau = self.get_tau()
 
         self.prev_data = None
-        
+
     def get_tau(self):
         return 1 / (2 * np.pi * self.cut_off_freqency)
 
@@ -46,7 +47,7 @@ class MovingAverage(object):
     def __init__(self, window_size) -> None:
         self.window_size = window_size
         self.ma = []
-    
+
     def filter(self, val):
         if len(self.ma) < self.window_size:
             self.ma.append(val)
@@ -83,34 +84,34 @@ class JointPosition(object):
         self.pos = None
         self.vel = np.zeros(16, dtype=float)
         self.acc = np.zeros(16, dtype=float)
-        
+
         self.t_prev = 0.
         self.pos_prev = np.zeros(16, dtype=float)
         self.vel_prev = np.zeros(16, dtype=float)
         self.acc_prev = np.zeros(16, dtype=float)
-        
+
         self.t_pprev = 0.
         self.pos_pprev = np.zeros(16, dtype=float)
         self.vel_pprev = np.zeros(16, dtype=float)
-        self.acc_pprev = np.zeros(16, dtype=float)        
-        
+        self.acc_pprev = np.zeros(16, dtype=float)
+
     def append(self, val: np.ndarray):
         self.t = time.perf_counter()
         self.pos = val
         self.vel = (self.pos - self.pos_prev) / (self.t - self.t_prev)
         self.acc = (self.vel - self.vel_prev) / (self.t - self.t_prev)
-        
+
         self.t_pprev = self.t_prev
         self.pos_pprev = self.pos_prev
         self.vel_pprev = self.vel_prev
         self.acc_pprev = self.acc_prev
-        
+
         self.t_prev = self.t
         self.pos_prev = self.pos
         self.vel_prev = self.vel
         self.acc_prev = self.acc
 
-    
+
 class SlaveState(TypedDict):
     frame: int
     joint_pos: np.ndarray
@@ -132,8 +133,7 @@ class PumpState(TypedDict):
     des_cur: float
     temp: int
 
-from collections.abc import Set
-from interass.msg import UI2Robot
+
 class CtrlCommand(TypedDict):
     joint_pos: np.ndarray
     joint_vel: np.ndarray
@@ -158,5 +158,3 @@ class PumpCommand(TypedDict):
 
 class DXLCommand(TypedDict):
     pos_cmd: np.ndarray
-    
-    

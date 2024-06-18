@@ -4,7 +4,7 @@ from rclpy.node import Node
 
 # TODO make write function for dxl
 
-DXL_ID = [11, 12, 14, 15, 16] # left, right, lift, trigger, trigger-directional
+DXL_ID = [11, 12, 14, 15, 16]  # left, right, lift, trigger, trigger-directional
 NUM_DXL = len(DXL_ID)
 
 DXL_BAUDRATE = 115200
@@ -20,10 +20,10 @@ ADDR_MX_D_GAIN = 26
 LEN_MX_GOAL_POSITION = 4
 LEN_MX_PRESENT_POSITION = 2
 
-# track_left, track_right, lifter, trigger
+# track_left, track_right, lifter, trigger, trigger_direction
 POS_DXL_IDLE = np.array([1050, 1710, 2600, 2300, 1600])
-POS_DXL_MIN = np.array([1600, 1160, 2310, 2210, 1430])
-POS_DXL_MAX = np.array([500, 2260, 2800, 2100, 1900])
+POS_DXL_MIN = np.array([1600, 1160, 2310, 2210, 1350])
+POS_DXL_MAX = np.array([500, 2260, 2800, 2100, 1775])
 
 
 class DXLControl:
@@ -52,8 +52,8 @@ class DXLControl:
         self.port.closePort()
 
     def run(self):
-        val_min = np.array([0, 0, -1, 500, 0])
-        val_max = np.array([1000, 1000, 1, 1000, 1])
+        val_min = np.array([0, 0, 1, 500, 0])
+        val_max = np.array([1000, 1000, 2, 1000, 1])
         while True:
             if self.conn.poll():
                 cmd = self.pipe_reciever()
@@ -73,13 +73,15 @@ class DXLControl:
         # cmd[i]
         # i = 0: left, 1: right, 2: lift, 3: trigger, 4: trigger-directional
         cmd = np.zeros(5)
-        if pos_cmd[3] == 0: # when trigger not activated
+        if pos_cmd[3] == 0:  # when trigger not activated
             cmd = np.array([pos_cmd[0], pos_cmd[1], pos_cmd[2], -1, -1])
-        elif pos_cmd[3] == -1:
-            cmd = np.array([-1, -1, -1, pos_cmd[1], 0])
-        elif pos_cmd[3] == 1:
-            cmd = np.array([-1, -1, -1, pos_cmd[1], 1])
-            
+        else:
+            trigger = pos_cmd[1] if pos_cmd[1] > 510 else -1
+            direction = 0 if pos_cmd[3] == -1 else 1
+            cmd = np.array([-1, -1, -1, trigger, direction])
+
+        if pos_cmd[2] == 0:
+            cmd[2] = -1
         return cmd
 
     @staticmethod
