@@ -1,4 +1,4 @@
-from multiprocessing import Process, Pipe
+from multiprocessing import Pipe
 import numpy as np
 import time
 
@@ -8,9 +8,7 @@ from Phidget22 import PhidgetException
 from Phidget22 import Phidget
 
 import copy
-
 import traceback
-import logging
 
 import rclpy
 from rclpy.node import Node
@@ -18,6 +16,7 @@ import rclpy.time
 import rclpy.timer
 
 from trajectory_msgs.msg import JointTrajectoryPoint
+
 
 class Control:
     def __init__(self, pipeset, parent_node: Node):
@@ -146,14 +145,35 @@ class Control:
                 0.5,
                 0.25,
                 0.5,
-                0.1,
-                0.25,
+                0.05,
+                0.5,
                 0.55,
                 0.18,
             ]
-            * 2
+            +
+            [
+                0.5,
+                0.5,
+                0.25,
+                0.5,
+                0.1,
+                0.5,
+                0.55,
+                0.18,
+            ]
         )
         self.ki_l = np.array(
+            [
+                0.0125,
+                0.0125 / 2,
+                0.0125 / 4,
+                0.0125 / 2,
+                0.0125 / 2,
+                0.0125 / 2,
+                0.0125,
+                0.0125,
+            ]
+            +            
             [
                 0.0125,
                 0.0125 / 2,
@@ -164,21 +184,17 @@ class Control:
                 0.0125,
                 0.0125,
             ]
-            * 2
         )
         self.kd_l = np.array([1, 2, 2, 1,5, 0.5, 1
                               , 1 ] * 2)
-        
-        
-
         self.integrator = Integrator()
         self.integrator_der = Integrator()
         self.st_w = Integrator()
 
-        self.lpm8_flow = np.polynomial.Polynomial(
-            [0, 0.822176, -0.02439, 0.227971, -0.03879, 0.00184]
-        )
-        self.lpm4_flow = np.polynomial.Polynomial([0, 0.86869, 0.16426, -0.01125])
+        self.lpm4_volt2flow = np.polynomial.Polynomial([0, 7.98165981e-01, 2.13200807e-01,  -2.22038022e-02,  6.18481728e-04])
+        self.lpm8_volt2flow = np.polynomial.Polynomial([0, 1.31690797,  -7.82755895e-01, 6.23129162e-01,  -1.30625241e-01, 1.16425220e-02,  -3.91794337e-04])
+        self.lpm4_flow2volt = np.polynomial.Polynomial([0, 1.06211344e+00,  -9.80945796e-02, 8.65724068e-03,  -2.38136350e-04])
+        self.lpm8_flow2volt = np.polynomial.Polynomial([0, 1.10423005e+00,  -1.81689101e-01, 1.95820118e-02,  -1.12389653e-03, 3.25762157e-05,  -3.70024441e-07])
 
         self.k_fd = 0
 
@@ -188,6 +204,7 @@ class Control:
         self.v_diff = FiniteDiff()
         self.q_ddiff = FiniteDDiff()
         self.con_q_integrator = Integrator()
+        self.moving_average_filter = MovingAverage(window_size=1, max_change=0.05, threshold=1, reset_threshold=1)
         self.c1_prev = 0.0
         self.c2_prev = 0.0
 
@@ -253,7 +270,8 @@ class Control:
     def err_calc(self):
         self.err = self.ref_pos - self.joint_pos
         self.err = (
-            (self.err * self.smooth_factor)
+            # (self.err * self.smooth_factor)
+            self.err
             * self.joint_power
             * np.isnan(self.cmd_override)
         )
@@ -331,8 +349,8 @@ class Control:
                 phidget.setEnabled(False)
 
     def joint_flow_estimator(self, v: np.ndarray):
-        flow_4 = self.lpm4_flow(v)
-        flow_8 = self.lpm8_flow(v)
+        flow_4 = self.lpm4_volt2flow(np.abs(v))
+        flow_8 = self.lpm8_volt2flow(np.abs(v))
         res = abs(
             np.where(
                 [True, False, False, True, False, False, False, False] * 2,
@@ -346,16 +364,31 @@ class Control:
     def mhpu_flow_estimator(rpm):
         return rpm * 2.7 / 1000
 
-    @staticmethod
-    def flow_distributer(vd: np.ndarray, Q_j, Q_h):
-        k_fd = np.divide(Q_h, Q_j.sum(), out=np.zeros(1), where=Q_j.sum() != 0)
-        v_fd = np.multiply(vd, k_fd, out=vd, where=k_fd < 1)
+    def flow_distributer(self, vd: np.ndarray, Q_j, Q_h):
+        k_fd = np.divide(Q_h, np.sum(Q_j[8:13]+0.5), out=np.zeros(1), where=np.sum(Q_j[8:13]) != 0)
+        # print("Q_j.sum()",Q_j.sum())
+        if k_fd < 1:
+            Q_fd = Q_j*k_fd
+            # print("Q_fd[13]", Q_fd[13])
+            volt_flow_4 = self.lpm4_flow2volt(Q_fd)*np.sign(vd)
+            volt_flow_8 = self.lpm8_flow2volt(Q_fd)*np.sign(vd)
+            v_fd = np.where(
+                [True, False, False, True, False, False, False, False] * 2,
+                volt_flow_8,
+                volt_flow_4,
+            )
+        else:
+            v_fd = vd
+        # print("Q_j.sum()",Q_j.sum())
+        # print("k_fd", k_fd)
+        # v_fd = np.multiply(vd, k_fd, out=vd, where=k_fd < 1)
         return v_fd
 
     @staticmethod
     def joint_saturator(v):
-        pump_4lpm_sat_v = 5.5
-        pump_8lpm_sat_v = 3.5
+        #pump MaxQ -> 2.7*2800/1000 = 7.56lpm
+        pump_4lpm_sat_v = 5.8
+        pump_8lpm_sat_v = 3.8
 
         v_p_max = np.where(
             [True, False, False, True, False, False, False, False] * 2,
@@ -363,8 +396,10 @@ class Control:
             pump_4lpm_sat_v,
         ) # saturated by pump
         v_h_max = (
-            np.array([3.27, 4.0, 4.06, 3.27, 1.7, 1.7, 1.7, 1.7] * 2)
+            np.array([3.5, 5.0, 5.0, 3.5, 1.7, 1.7, 1.7, 1.7] * 2)
         )  # saturated by hose
+           # 1~4 hose max Q : 6.3LPM(추정)
+           # 5~8 hose max Q : 1.46LPM
 
         v = np.clip(v, -v_p_max, v_p_max)
         v = np.clip(v, -v_h_max, v_h_max)
@@ -683,12 +718,12 @@ class Control:
             t = time.monotonic_ns()
             self.integrator.initialize(t, np.zeros(16))
             self.integrator_der.initialize(t, np.zeros(16))
-            clamp_sat_limit = 5.5
+            # clamp_sat_limit = 5.5
             actuator_sat_limit = 9.9
             self.t_pre = None
             self.v_pre = None
-            a_tr = np.zeros(16)
-            v_tr = np.zeros(16)
+            # a_tr = np.zeros(16)
+            # v_tr = np.zeros(16)
             while True:
                 if self.conn.poll():
                     self.receiver()
@@ -700,7 +735,7 @@ class Control:
 
                 err = self.err_calc()
                 err_l = self.qtoc(self.ref_pos) - self.qtoc(self.joint_pos)
-                err = err_l
+                err = err_l*self.smooth_factor
                 err[4] *= -1
                 err[12] *= -1
 
@@ -711,10 +746,10 @@ class Control:
                 )
                 k = self.cal_gainScaleFactor()
                 vd = vd*k
-                for i in range(16):
-                    pullGainFactor = np.array([0.75, 0.75, 0.75, 0.75,1,0.816,0.816,0.816]*2)
-                    if vd[i]<0:
-                        vd[i] = vd[i]*pullGainFactor[i]
+                # for i in range(16):
+                #     pullGainFactor = np.array([0.75, 0.75, 0.75, 0.75, 1, 0.816, 0.816, 0.816]*2)
+                #     if vd[i] < 0:
+                #         vd[i] = vd[i]*pullGainFactor[i]
                 
                 v_tr_max = np.zeros(16)
                 # v_tr_max = self.cal_v_tr_max(self.joint_pos,v_tr)
@@ -728,25 +763,26 @@ class Control:
                 # vd_sat = self.tr_joint_saturator(vd,v_tr_max,v_dot_tr_max,v_diff,t)
                 #vd = self.joint_acc_saturator(vd,v_diff,t)
                 vd_sat = self.joint_saturator(vd)
-                
-
+                vd_sat = np.array(vd_sat)
 
                 self.is_clamp = (vd_sat != vd) & (np.sign(vd) == np.sign(err))
-                if np.abs(err[12]) < 0.5:
+                if np.abs(err[12]) < 0.15:
                     self.is_clamp[12]=True
+                if np.abs(err[4]) < 0.15:
+                    self.is_clamp[4]=True
                 # Q_j_est = self.joint_flow_estimator(vd_sat)
                 # Q_p_est = self.mhpu_flow_estimator(self.des_rpm)
-                # v_fc = self.flow_distributer(vd_sat, Q_j_est, Q_p_est*1.2)
-                v_dc = self.dead_zone_compensate(vd_sat, 1.2, 0.01)
+                # v_fc = self.flow_distributer(vd_sat, Q_j_est, Q_p_est)
+                v_fc = self.moving_average_filter.update(vd_sat) 
+                v_dc = self.dead_zone_compensate(v_fc, 1.2, 0.01)
                 cmd = v_dc
-                cmd[~np.isnan(self.cmd_override)] = self.cmd_override[
-                    ~np.isnan(self.cmd_override)
-                ]
+                cmd[~np.isnan(self.cmd_override)] = self.cmd_override[~np.isnan(self.cmd_override)]
                 cmd = self.min_max_saturation(cmd)
                 cmd = np.clip(
                     cmd, -actuator_sat_limit, actuator_sat_limit
                 )  # saturate command in range of phidget's range
-                cmd = np.where(self.joint_power.astype(bool), cmd, 0)
+                # print("smooth_factor", self.smooth_factor[13])
+                cmd = np.where(self.joint_power.astype(bool), cmd, 0.0)
                 self.allocate_cmd(cmd)
                 frame += 1
                 if not self.conn_opp.poll():
@@ -976,6 +1012,81 @@ class FiniteDDiff:
         self.t_pprev = copy.deepcopy(self.t_prev)
         self.t_prev = copy.deepcopy(t)
         return ddiff
+
+class MovingAverage:
+    def __init__(self, window_size, max_change, threshold, reset_threshold):
+        """
+        Initialize the moving average filter with the specified parameters.
+
+        Parameters:
+        window_size (int): The size of the moving window.
+        max_change (float): The maximum allowed change per update.
+        threshold (float): The threshold for applying the moving average.
+        reset_threshold (float): The threshold for resetting the moving average.
+        """
+        self.window_size = window_size
+        self.windows = np.zeros((16, window_size))
+        self.indices = np.zeros(16, dtype=int)
+        self.counts = np.zeros(16, dtype=int)
+        self.last_values = np.full(16, None)
+        self.exceed_counts = np.zeros(16, dtype=int)
+        self.max_change = max_change
+        self.threshold = threshold
+        self.reset_threshold = reset_threshold
+        self.last_smooth_values = np.zeros(16)  # Initialize the last smoothed values
+        self.view_change = None
+
+    def update(self, values):
+        """
+        Update the moving average with new values if the change exceeds the threshold.
+        Reset the moving average if the change exceeds the reset threshold.
+
+        Parameters:
+        values (np.ndarray): The new values to add to the windows.
+
+        Returns:
+        np.ndarray: The current moving averages.
+        """
+        smoothed_values = np.zeros(16)
+        
+        for i in range(16):
+            value = values[i]
+            
+            if abs(value - self.last_smooth_values[i]) < self.threshold:
+                self.exceed_counts[i] += 1
+            else:
+                self.exceed_counts[i] = 0
+
+            if self.exceed_counts[i] >= self.reset_threshold:
+                self.reset(i)
+
+            # Adjust value within allowed change limits
+            if self.last_values[i] is not None:
+                change = value - self.last_values[i]
+                if change > self.max_change:
+                    value = self.last_values[i] + self.max_change
+                elif change < -self.max_change:
+                    value = self.last_values[i] - self.max_change
+
+            self.windows[i, self.indices[i]] = value
+            self.indices[i] = (self.indices[i] + 1) % self.window_size
+            self.counts[i] = min(self.counts[i] + 1, self.window_size)
+
+            self.last_values[i] = value
+            self.last_smooth_values[i] = np.mean(self.windows[i, :self.counts[i]])
+            smoothed_values[i] = self.last_smooth_values[i]
+        
+        return smoothed_values
+
+    def reset(self, index):
+        """Reset the moving average filter for a specific index."""
+        self.windows[index].fill(0)
+        self.indices[index] = 0
+        self.counts[index] = 0
+        self.last_values[index] = None
+        self.exceed_counts[index] = 0
+        self.last_smooth_values[index] = 0.0
+
 
 
 if __name__ == "__main__":

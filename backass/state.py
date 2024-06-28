@@ -26,6 +26,12 @@ class SensorRead:
         self.cui_addr = left_cui_addr + right_cui_addr
         self.joint_pos = JointPosition()
 
+        self.offset = np.zeros(16)
+        self.offset[8+0] = -0.5
+        self.offset[8+2] = 6.
+        self.offset[8+5] = -5.
+        self.offset[3] = 7
+
         self.conn = pipeset[0]
         self.conn_opp = pipeset[1]
         self.conn_slow = pipeset[2]
@@ -41,11 +47,10 @@ class SensorRead:
         frame = 0
         lpf = LowPassFilter(1, 1/100)
         timestamp_prev = time.perf_counter()
-        
+    
         while True:
             try:
                 timestamp = time.perf_counter()
-                dt = timestamp - timestamp_prev
                 timestamp_prev = timestamp
                 if self.conn_pause.poll():
                     res = self.conn_pause.recv()
@@ -58,7 +63,8 @@ class SensorRead:
                 if joint_pos is None:
                     continue
                 elif not self.conn_opp.poll():
-                    frame += 1                    
+                    frame += 1
+                    joint_pos += self.offset
                     joint_pos = lpf.filter(joint_pos)
                     self.joint_pos.append(joint_pos)
                     self.conn.send({"joint_pos": self.joint_pos.pos,
@@ -135,9 +141,6 @@ class SensorRead:
             & np.char.count((list(map(bin, odd_masked[:, 0]))), "1") % 2
         ).all()
 
-
-
-        
 
 if __name__ == "__main__":
     from multiprocessing.connection import Pipe

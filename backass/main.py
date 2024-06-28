@@ -13,7 +13,7 @@ from Phidget22.Phidget import Phidget
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_system_default, qos_profile_sensor_data
+from rclpy.qos import qos_profile_system_default, qos_profile_sensor_data, qos_profile_services_default
 from std_msgs.msg import Header
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectoryPoint
@@ -27,8 +27,13 @@ from ass_msgs.msg import (
     ArmMasterCommInt,
     TrajectoryExecution,
     TrajectoryEnabled,
+    TrajectoryFeedback,
     DXLCommand,
-    ManualVolt
+    ManualVolt,
+    ARMstrongTrajectory,
+    ARMstrongTrajectoryEnabled,
+    ARMstrongTrajectoryExecution,
+    ARMstrongTrajectoryFeedback
 )
 import control
 import pump
@@ -217,19 +222,24 @@ class Robot(Node):
             TrajectoryExecution,
             "traj_exec",
             callback=self.cb_traj_exec,
-            qos_profile=qos_profile_system_default
+            qos_profile=qos_profile_services_default
         )
         self.planned_trajectory_sub = self.create_subscription(
             MotionPlanResponse,
             "planned_trajectory",
             callback=self.cb_planned_trajectory,
-            qos_profile=qos_profile_system_default
+            qos_profile=qos_profile_services_default
         )
-        self.trajectory_enabled = self.create_subscription(
+        self.trajectory_enabled_sub = self.create_subscription(
             TrajectoryEnabled,
             "traj_enabled",
-            qos_profile=qos_profile_system_default,
+            qos_profile=qos_profile_services_default,
             callback=self.cb_trajectory_enabled,
+        )
+        self.trajectory_feedback_pub = self.create_publisher(
+            TrajectoryFeedback,
+            "traj_feedback",
+            qos_profile=qos_profile_services_default,
         )
         self.dxl_command_sub = self.create_subscription(
             DXLCommand,
@@ -237,22 +247,45 @@ class Robot(Node):
             qos_profile=qos_profile_system_default,
             callback=self.cb_dxl_command
         )
-        self.manual_volt_susb = self.create_subscription(
+        self.manual_volt_sub = self.create_subscription(
             ManualVolt,
             "manual_volt",
             qos_profile=qos_profile_system_default,
             callback=self.cb_manual_volt
+        )
+        self.astr_traj_sub = self.create_subscription(
+            ARMstrongTrajectory,
+            "astr_traj",
+            qos_profile=qos_profile_system_default,
+            callback=self.cb_astr_traj
+        )
+        self.astr_traj_enabled_sub = self.create_subscription(
+            ARMstrongTrajectoryEnabled,
+            "astr_traj_enabled",
+            qos_profile=qos_profile_system_default,
+            callback=self.cb_astr_traj_enabled
+        )
+        self.astr_traj_exec_sub = self.create_subscription(
+            ARMstrongTrajectoryExecution,
+            "astr_traj_execution",
+            qos_profile=qos_profile_system_default,
+            callback=self.cb_astr_traj_execution
+        )
+        self.astr_traj_fb_pub = self.create_publisher(
+            ARMstrongTrajectoryFeedback,
+            "astr_traj_feedback",
+            qos_profile=qos_profile_system_default
         )
 
         self.pose_override_enabled = False
         self.pose_override_dxl = 0
 
         self.traj_enabled = False
-        self.traj_dxl_cmd = 0
         self.traj_point = JointTrajectoryPoint()
 
         self.t_traj_exec_started = None
         self.trajectory: list = []
+        self.trajectory_dxl = []
         self.trajectory_idx = 0
 
         self.dxl_enabled = False
@@ -338,7 +371,7 @@ class Robot(Node):
                 pump_des_cur=self.pump_state["des_cur"],
                 pump_temp=self.pump_state["elmo_temp"],
                 arm_state=self.sl_state["joint_pos"],
-                ref_state=self.ms_state["joint_pos"],
+                ref_state=self.ref_pos,
                 track_left_state=int(self.ms_state["track_cmd"][0]),
                 track_right_state=int(self.ms_state["track_cmd"][1]),
                 cmd_voltage=self.ctrl_state["cmd"],
@@ -369,6 +402,11 @@ class Robot(Node):
         joint_state.velocity = joint_vel.tolist()
         self.moveit_pub.publish(joint_state)
 
+    def cb_trajectory_enabled(self, data: TrajectoryEnabled):
+        self.traj_enabled = data.enabled
+        self.t_traj_exec_started = None
+        self.get_logger().info(f"trajectory by moveit mode: {self.traj_enabled}")
+
     def cb_traj_exec(self, data):
         self.get_logger().info("starting execution....")
         self.trajectory_idx = 0
@@ -380,6 +418,23 @@ class Robot(Node):
         self.trajectory_idx = 0
         # self.hpu_profile = self.asdf(self.trajectory)
         self.get_logger().info("planned trajectory received")
+
+    def cb_astr_traj(self, data: ARMstrongTrajectory):
+        self.t_traj_exec_started = None
+        self.trajectory = list(data.points)
+        self.trajectory_dxl = data.trigger
+        self.trajectory_idx = 0
+        self.get_logger().info("planned trajectory received")
+
+    def cb_astr_traj_enabled(self, data: ARMstrongTrajectoryEnabled):
+        self.traj_enabled = data.enabled
+        self.t_traj_exec_started = None
+        self.get_logger().info(f"trajectory mode: {self.traj_enabled}")
+
+    def cb_astr_traj_execution(self, data: ARMstrongTrajectoryExecution):
+        self.get_logger().info("starting execution....")
+        self.t_traj_exec_started = time.time_ns()
+        self.trajectory_idx = 0
 
     def calc_Q(self, traj_pos, traj_vel):
         # 5축은 쓰레기값
@@ -400,12 +455,6 @@ class Robot(Node):
         tr_Q = dc_dt*A_push*(traj_vel >= 0)*60000+dc_dt*A_pull*(traj_vel < 0)*60000
 
         return tr_Q
-
-    def cb_trajectory_enabled(self, data: TrajectoryEnabled):
-        self.traj_enabled = data.enabled
-
-        self.t_traj_exec_started = None
-        self.get_logger().info(f"trajectory mode: {self.traj_enabled}")
 
     def start_proc(self):
         # self.ms_proc_handle.start()
@@ -490,7 +539,7 @@ class Robot(Node):
 
         self.ms_state["joint_pos"] = ms_joint_state
         # FIXME
-        self.ms_state["lift_cmd"] = np.array([data.lifter, data.pump])
+        self.ms_state["lift_cmd"] = np.array([data.lifter, 2 if data.pump == -1 else data.pump])
         self.ms_state["track_cmd"] = np.array([data.lever_0, data.lever_1])
 
     def cb_dxl_command(self, data: DXLCommand):
@@ -501,7 +550,7 @@ class Robot(Node):
         self.dxl_manual_value[3] = data.mode_toggle
 
     def cb_manual_volt(self, data: ManualVolt):
-        value = np.where(data.override_enabled, data.volt_override, np.nan)
+        value = np.where(list(data.override_enabled), data.volt_override, np.nan)
         self.cmd_override = value
 
     def init_ref(self):
@@ -560,29 +609,45 @@ class Robot(Node):
                             + self.trajectory[self.trajectory_idx]
                             .time_from_start.nanosec)
                     time_passed = time.time_ns() - self.t_traj_exec_started
-                    if time_passed > nsec:
+                    if time_passed > nsec:  # increase index if time passed
                         self.trajectory_idx += 1
-                    if self.trajectory_idx >= len(self.trajectory):
+                        self.get_logger().info(f"{self.trajectory_idx}/{len(self.trajectory)}")
+                        self.trajectory_feedback_pub.publish(
+                            TrajectoryFeedback(index=self.trajectory_idx, finished=False))
+
+                    if self.trajectory_idx >= len(self.trajectory):  # end trajectory mode
                         self.t_traj_exec_started = None
+                        self.trajectory_feedback_pub.publish(
+                            TrajectoryFeedback(finished=True))
                         continue
-                    elif self.trajectory_idx == len(self.trajectory) - 1:
+                    elif self.trajectory_idx == len(self.trajectory) - 1:  # finalize trajectory mode
                         interpolated = np.rad2deg(
                             self.trajectory[self.trajectory_idx].positions)
+                    else:  # trajectory mode normal condition
+                        position = np.rad2deg(self.trajectory[self.trajectory_idx].positions)
+                        position_next = np.rad2deg(self.trajectory[self.trajectory_idx + 1].positions)
+                        nsec_next = (self.trajectory[self.trajectory_idx + 1].time_from_start.sec * 1e9
+                                     + self.trajectory[self.trajectory_idx + 1].time_from_start.nanosec)
+                        interpolated = (position
+                                        + (time_passed - nsec) * (position_next - position) / (nsec_next - nsec))
+
+                    if interpolated.shape[0] == 16:
+                        position = np.deg2rad(interpolated)
+                        is_on_hold = np.where(np.isnan(position), True, is_on_hold)
+                        ms_state["joint_pos"] = np.array(position)
+                        ms_state["track_cmd"][0] = -1
+                        ms_state["track_cmd"][1] = self.trajectory_dxl[self.trajectory_idx]
+                        ms_state["lift_cmd"][0] = 0
+                        ms_state["lift_cmd"][1] = 1
                     else:
-                        position = np.rad2deg(
-                            self.trajectory[self.trajectory_idx].positions)
-                        position_next = np.rad2deg(
-                            self.trajectory[self.trajectory_idx + 1].positions)
-                        nsec_next = (
-                            self.trajectory[self.trajectory_idx + 1].time_from_start.sec * 1e9
-                            + self.trajectory[self.trajectory_idx + 1].time_from_start.nanosec)
-                        interpolated = (position + (time_passed - nsec)
-                                        * (position_next - position) / (nsec_next - nsec))
-                    position = [np.nan] * 8
-                    position.extend(interpolated)
-                    position.extend([np.nan] * 2)
-                    is_on_hold = np.where(np.isnan(position), True, is_on_hold)
-                    ms_state["joint_pos"] = np.array(position)
+                        position = [np.nan] * 8
+                        position.extend(interpolated)
+                        position.extend([np.nan] * 2)
+                        is_on_hold = np.where(np.isnan(position), True, is_on_hold)
+                        ms_state["joint_pos"] = np.array(position)
+                elif self.traj_enabled:
+                    is_on_hold = np.ones_like(is_on_hold, dtype=bool)
+
                 if self.dxl_enabled:
                     ms_state["track_cmd"][0] = self.dxl_manual_value[0]
                     ms_state["track_cmd"][1] = self.dxl_manual_value[1]
@@ -610,7 +675,7 @@ class Robot(Node):
                 self.is_on_hold_prev = is_on_hold
 
                 smooth_factor = np.clip(
-                    (t_ros.nanoseconds // 1e9 - self.joint_when_on) / 2, 0, 1
+                    (t_ros.nanoseconds / 1e9 - self.joint_when_on)/2, 0, 1
                 )
                 ctrl_cmd = {
                     "joint_pos": self.sl_state["joint_pos"],
@@ -662,7 +727,7 @@ class Robot(Node):
                     / (time_frame[-1][0] - time_frame[0][0])
                     * 1e9
                 )
-                self.ms_state = ms_state
+                # self.ms_state = copy.deepcopy(ms_state)
 
                 sl_proc_exitcode = self.sl_proc_handle.exitcode
                 ctrl_proc_exitcode = self.ctrl_proc_handle.exitcode

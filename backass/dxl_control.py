@@ -21,9 +21,9 @@ LEN_MX_GOAL_POSITION = 4
 LEN_MX_PRESENT_POSITION = 2
 
 # track_left, track_right, lifter, trigger, trigger_direction
-POS_DXL_IDLE = np.array([1050, 1710, 2600, 2300, 1600])
-POS_DXL_MIN = np.array([1600, 1160, 2310, 2210, 1350])
-POS_DXL_MAX = np.array([500, 2260, 2800, 2100, 1775])
+POS_DXL_IDLE = np.array([1050, 1710, 2600, 2300, 1500])
+POS_DXL_MIN = np.array([1600, 1160, 2310, 2210, 1200])
+POS_DXL_MAX = np.array([500, 2260, 2800, 2100, 1800])
 
 
 class DXLControl:

@@ -40,9 +40,9 @@ class Pump:
         self.min_rpm = 300
         self.max_rpm = 2000
         self.max_err = 50
-        self.max_acc = 2000
-        self.max_dec = 2000
-        self.tgt_stop_dec = 2500
+        self.max_acc = 3000
+        self.max_dec = 3000
+        self.tgt_stop_dec = 6000
         self.has_motor_enabled = False
         self.has_motor_disabled = False
 
